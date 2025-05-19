@@ -4,7 +4,10 @@ let userProjects = [];
 let userFollowers = [];
 let userFollowing = [];
 let isLoadingMore = false;
-let room = new WebsimSocket(); // Initialize WebsimSocket for database access
+let room = null; // Will be initialized with proper error handling
+let websocketRetryCount = 0;
+const MAX_WEBSOCKET_RETRIES = 5;
+const WEBSOCKET_RETRY_DELAY = 2000; // 2 seconds
 
 // Cache configuration
 const CACHE_CONFIG = {
@@ -17,6 +20,9 @@ const CACHE_CONFIG = {
 // Initialize the app
 async function init() {
     try {
+        // Initialize WebsimSocket with proper error handling
+        await initializeWebsimSocket();
+        
         // Get the current user (for this demo we're using the creator)
         const creator = await window.websim.getCreator();
         if (!creator) {
@@ -36,11 +42,101 @@ async function init() {
         loadProjects();
     } catch (error) {
         console.error("Initialization error:", error);
-        showError("Failed to initialize the app");
+        showError("Failed to initialize the app: " + error.message);
     }
 }
 
-// Cache Management Functions
+// Initialize WebsimSocket with error handling and reconnection logic
+async function initializeWebsimSocket() {
+    return new Promise((resolve, reject) => {
+        try {
+            room = new WebsimSocket();
+            
+            // Handle connection events
+            room.onOpen = () => {
+                console.log("WebsimSocket connected");
+                websocketRetryCount = 0; // Reset retry counter on successful connection
+                resolve(room);
+            };
+            
+            room.onError = (error) => {
+                console.error("WebsimSocket error:", error);
+                handleWebsocketError(error);
+            };
+            
+            room.onClose = () => {
+                console.warn("WebsimSocket closed");
+                if (websocketRetryCount < MAX_WEBSOCKET_RETRIES) {
+                    websocketRetryCount++;
+                    console.log(`Reconnecting WebsimSocket (attempt ${websocketRetryCount}/${MAX_WEBSOCKET_RETRIES})...`);
+                    setTimeout(() => {
+                        initializeWebsimSocket()
+                            .then(() => console.log("WebsimSocket reconnected successfully"))
+                            .catch(err => console.error("Failed to reconnect WebsimSocket:", err));
+                    }, WEBSOCKET_RETRY_DELAY * websocketRetryCount);
+                } else {
+                    console.error("WebsimSocket reconnection failed after maximum retries");
+                    showError("Connection to server lost. Please refresh the page.");
+                }
+            };
+            
+            // Add a custom error handler for the specific enqueue error
+            const originalOnMessage = room.socket?.onmessage;
+            if (room.socket && originalOnMessage) {
+                room.socket.onmessage = function(event) {
+                    try {
+                        originalOnMessage.call(this, event);
+                    } catch (error) {
+                        if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+                            console.warn("Caught ReadableStream enqueue error, reconnecting...");
+                            room.reconnect();
+                        } else {
+                            throw error;
+                        }
+                    }
+                };
+            }
+            
+            // Add reconnect method if not already present
+            if (!room.reconnect) {
+                room.reconnect = function() {
+                    try {
+                        if (this.socket) {
+                            this.socket.close();
+                        }
+                        // Re-initialize the socket
+                        this.connect();
+                        console.log("Reconnection initiated");
+                    } catch (reconnectError) {
+                        console.error("Error during reconnection:", reconnectError);
+                    }
+                };
+            }
+            
+            resolve(room);
+        } catch (error) {
+            console.error("Error initializing WebsimSocket:", error);
+            reject(error);
+        }
+    });
+}
+
+// Generic handler for WebSocket errors
+function handleWebsocketError(error) {
+    if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+        console.warn("ReadableStream is closed, attempting to reconnect");
+        if (room && room.reconnect) {
+            room.reconnect();
+        } else {
+            // Fallback if no reconnect method exists
+            initializeWebsimSocket()
+                .then(() => console.log("WebsimSocket reinitialized successfully"))
+                .catch(err => console.error("Failed to reinitialize WebsimSocket:", err));
+        }
+    }
+}
+
+// Cache Management Functions with improved error handling
 // -------------------------
 
 // Check if a cache entry is expired
@@ -81,52 +177,107 @@ function getFromLocalCache(key, expiryTime) {
     }
 }
 
-// Save projects data to database cache
+// Save projects data to database cache with retry logic
 async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery) {
-    try {
-        const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
-        await room.collection('profile_cache').create({
-            username: username,
-            cache_key: cacheKey,
-            data: projects,
-            timestamp: new Date().toISOString()
-        });
-        return true;
-    } catch (error) {
-        console.warn('Failed to save to database cache:', error);
-        return false;
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+        try {
+            // Check if connection is alive
+            if (!room) {
+                await initializeWebsimSocket();
+            }
+            
+            const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+            await room.collection('profile_cache').create({
+                username: username,
+                cache_key: cacheKey,
+                data: projects,
+                timestamp: new Date().toISOString()
+            });
+            return true;
+        } catch (error) {
+            retryCount++;
+            console.warn(`Failed to save to database cache (attempt ${retryCount}/${maxRetries}):`, error);
+            
+            // If it's the ReadableStream error, try to reconnect
+            if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+                handleWebsocketError(error);
+            }
+            
+            if (retryCount < maxRetries) {
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+            } else {
+                console.error('All attempts to save to database cache failed');
+                return false;
+            }
+        }
     }
+    
+    return false;
 }
 
-// Get projects from database cache if not expired
+// Get projects from database cache with retry logic
 async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
-    try {
-        const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
-        const cacheEntries = room.collection('profile_cache')
-            .filter({ username: username, cache_key: cacheKey })
-            .getList();
+    const maxRetries = 3;
+    let retryCount = 0;
+    
+    while (retryCount < maxRetries) {
+        try {
+            // Check if connection is alive
+            if (!room) {
+                await initializeWebsimSocket();
+            }
             
-        if (!cacheEntries || cacheEntries.length === 0) return null;
-        
-        // Sort by timestamp to get the most recent cache entry
-        const sortedEntries = [...cacheEntries].sort((a, b) => 
-            new Date(b.timestamp) - new Date(a.timestamp)
-        );
-        
-        const latestCache = sortedEntries[0];
-        const cacheTimestamp = new Date(latestCache.timestamp).getTime();
-        
-        if (isCacheExpired(cacheTimestamp, CACHE_CONFIG.projectsDbExpiry)) {
-            // Clean up expired cache
-            await room.collection('profile_cache').delete(latestCache.id);
-            return null;
+            const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+            const cacheEntries = room.collection('profile_cache')
+                .filter({ username: username, cache_key: cacheKey })
+                .getList();
+                
+            if (!cacheEntries || cacheEntries.length === 0) return null;
+            
+            // Sort by timestamp to get the most recent cache entry
+            const sortedEntries = [...cacheEntries].sort((a, b) => 
+                new Date(b.timestamp) - new Date(a.timestamp)
+            );
+            
+            const latestCache = sortedEntries[0];
+            const cacheTimestamp = new Date(latestCache.timestamp).getTime();
+            
+            if (isCacheExpired(cacheTimestamp, CACHE_CONFIG.projectsDbExpiry)) {
+                // Clean up expired cache with error handling
+                try {
+                    await room.collection('profile_cache').delete(latestCache.id);
+                } catch (deleteError) {
+                    console.warn('Failed to delete expired cache:', deleteError);
+                    // Continue even if deletion fails
+                }
+                return null;
+            }
+            
+            return latestCache.data;
+        } catch (error) {
+            retryCount++;
+            console.warn(`Failed to read from database cache (attempt ${retryCount}/${maxRetries}):`, error);
+            
+            // If it's the ReadableStream error, try to reconnect
+            if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+                handleWebsocketError(error);
+            }
+            
+            if (retryCount < maxRetries) {
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+            } else {
+                console.error('All attempts to read from database cache failed');
+                return null;
+            }
         }
-        
-        return latestCache.data;
-    } catch (error) {
-        console.warn('Failed to read from database cache:', error);
-        return null;
     }
+    
+    return null;
 }
 
 // Load user profile data
@@ -134,11 +285,14 @@ async function loadUserProfile(username) {
     try {
         // Get user details
         const response = await fetch(`/api/v1/users/${username}`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch user data: ${response.status} ${response.statusText}`);
+        }
+        
         const userData = await response.json();
         
         if (!userData.user) {
-            showError("User not found");
-            return;
+            throw new Error("User not found");
         }
         
         // Update user details in the UI
@@ -159,7 +313,7 @@ async function loadUserProfile(username) {
         await loadFollowingCount(username);
     } catch (error) {
         console.error("Error loading user profile:", error);
-        showError("Failed to load user profile");
+        showError("Failed to load user profile: " + error.message);
     }
 }
 
@@ -901,7 +1055,7 @@ function setupEventListeners() {
     profileHeader.appendChild(clearCacheBtn);
 }
 
-// Clear all caches (for testing)
+// Clear all caches with improved error handling
 async function clearAllCaches() {
     try {
         // Clear localStorage caches
@@ -915,13 +1069,43 @@ async function clearAllCaches() {
         
         keysToRemove.forEach(key => localStorage.removeItem(key));
         
-        // Clear database caches for this user
-        const cacheEntries = room.collection('profile_cache')
-            .filter({ username: currentUser.username })
-            .getList();
-            
-        for (const entry of cacheEntries) {
-            await room.collection('profile_cache').delete(entry.id);
+        // Clear database caches for this user with retry logic
+        const maxRetries = 3;
+        let retryCount = 0;
+        let success = false;
+        
+        // Check if WebsimSocket is initialized
+        if (!room) {
+            await initializeWebsimSocket();
+        }
+        
+        while (retryCount < maxRetries && !success) {
+            try {
+                const cacheEntries = room.collection('profile_cache')
+                    .filter({ username: currentUser.username })
+                    .getList();
+                    
+                for (const entry of cacheEntries) {
+                    await room.collection('profile_cache').delete(entry.id);
+                }
+                
+                success = true;
+            } catch (error) {
+                retryCount++;
+                console.warn(`Failed to clear database caches (attempt ${retryCount}/${maxRetries}):`, error);
+                
+                // If it's the ReadableStream error, try to reconnect
+                if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+                    handleWebsocketError(error);
+                }
+                
+                if (retryCount < maxRetries) {
+                    // Wait before retrying
+                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
+                } else {
+                    throw new Error('All attempts to clear database caches failed');
+                }
+            }
         }
         
         alert('All caches cleared!');
@@ -939,21 +1123,52 @@ async function clearAllCaches() {
         }
     } catch (error) {
         console.error('Error clearing caches:', error);
-        alert('Failed to clear some caches');
+        showError('Failed to clear some caches: ' + error.message);
     }
 }
 
-// Show error message
+// Show error message with more details
 function showError(message) {
+    console.error("ERROR:", message);
+    
     const container = document.querySelector('.container');
     const errorElement = document.createElement('div');
     errorElement.className = 'error-message';
     errorElement.textContent = message;
+    
+    // Add retry button for connection errors
+    if (message.includes('connection') || message.includes('network') || message.includes('WebSocket')) {
+        const retryButton = document.createElement('button');
+        retryButton.textContent = 'Retry Connection';
+        retryButton.className = 'retry-button';
+        retryButton.addEventListener('click', async () => {
+            errorElement.textContent = 'Reconnecting...';
+            try {
+                await initializeWebsimSocket();
+                errorElement.remove();
+                // Reload current tab
+                const activeTab = document.querySelector('.tab-btn.active').getAttribute('data-tab');
+                if (activeTab === 'projects') {
+                    loadProjects();
+                } else if (activeTab === 'followers') {
+                    loadFollowers();
+                } else if (activeTab === 'following') {
+                    loadFollowing();
+                } else if (activeTab === 'analytics') {
+                    loadAnalytics();
+                }
+            } catch (error) {
+                errorElement.textContent = 'Reconnection failed: ' + error.message;
+            }
+        });
+        errorElement.appendChild(retryButton);
+    }
+    
     container.prepend(errorElement);
     
     setTimeout(() => {
         errorElement.remove();
-    }, 5000);
+    }, 10000); // Show error for 10 seconds
 }
 
 // Initialize the app when page loads
