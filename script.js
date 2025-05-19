@@ -22,7 +22,9 @@ const FETCH_CONFIG = {
         300 * 1000  // 5 minutes
     ],
     maxDelay: 300 * 1000, // 5 minutes (cap)
-    retryStatusCodes: [408, 429, 500, 502, 503, 504] // Status codes to retry
+    retryStatusCodes: [408, 429, 500, 502, 503, 504], // Status codes to retry
+    batchSizes: [50, 25, 10, 5, 1], // Fallback batch sizes when a cursor fails
+    maxConsecutiveFailures: 3 // Number of consecutive failures before trying fallback strategy
 };
 
 // Cache configuration
@@ -32,6 +34,9 @@ const CACHE_CONFIG = {
     followersExpiry: 1000 * 60 * 30, // 30 minutes
     followingExpiry: 1000 * 60 * 30, // 30 minutes
 };
+
+// Track failed cursors to implement smarter retry strategies
+const failedCursors = new Map();
 
 // Initialize the app
 async function init() {
@@ -63,17 +68,35 @@ async function init() {
 }
 
 // Fetch wrapper with retry logic for HTTP errors
-async function fetchWithRetry(url, options = {}, retryCount = 0) {
+async function fetchWithRetry(url, options = {}, retryCount = 0, cursorFailures = 0) {
     try {
         // Add progress indicator to UI if this is a retry
         if (retryCount > 0) {
             updateFetchStatus(`Retry attempt ${retryCount} for: ${url.split('?')[0]}`);
         }
         
+        // Extract cursor from URL for tracking purposes
+        const cursor = extractCursorFromUrl(url);
+        
+        // Check if this cursor has failed multiple times and should use fallback strategy
+        if (cursor && failedCursors.has(cursor)) {
+            const failures = failedCursors.get(cursor);
+            if (failures >= FETCH_CONFIG.maxConsecutiveFailures) {
+                console.warn(`Cursor ${cursor} has failed ${failures} times. Attempting fallback strategy...`);
+                return await fetchWithFallbackStrategy(url, options, cursor);
+            }
+        }
+        
         const response = await fetch(url, options);
         
         // If we get a status code that warrants retry
         if (!response.ok && FETCH_CONFIG.retryStatusCodes.includes(response.status)) {
+            // Track cursor failure
+            if (cursor) {
+                const failures = failedCursors.get(cursor) || 0;
+                failedCursors.set(cursor, failures + 1);
+            }
+            
             // Calculate delay based on retry schedule
             const scheduleIndex = Math.min(retryCount, FETCH_CONFIG.retrySchedule.length - 1);
             const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
@@ -82,11 +105,25 @@ async function fetchWithRetry(url, options = {}, retryCount = 0) {
             updateFetchStatus(`Server error (${response.status}). Retrying in ${Math.round(delay/1000)}s...`);
             
             await new Promise(resolve => setTimeout(resolve, delay));
-            return fetchWithRetry(url, options, retryCount + 1);
+            
+            // If this is a cursor-based request that keeps failing, increase the cursor failure count
+            if (cursor) {
+                cursorFailures++;
+                if (cursorFailures >= FETCH_CONFIG.maxConsecutiveFailures) {
+                    return await fetchWithFallbackStrategy(url, options, cursor);
+                }
+            }
+            
+            return fetchWithRetry(url, options, retryCount + 1, cursorFailures);
         }
         
         if (!response.ok) {
             throw new Error(`${response.status} ${response.statusText}`);
+        }
+        
+        // Reset cursor failure count on success
+        if (cursor) {
+            failedCursors.delete(cursor);
         }
         
         // Clear any fetch status indicators on success
@@ -103,7 +140,7 @@ async function fetchWithRetry(url, options = {}, retryCount = 0) {
             updateFetchStatus(`Network error. Retrying in ${Math.round(delay/1000)}s...`);
             
             await new Promise(resolve => setTimeout(resolve, delay));
-            return fetchWithRetry(url, options, retryCount + 1);
+            return fetchWithRetry(url, options, retryCount + 1, cursorFailures);
         }
         
         // Non-retriable error
@@ -112,8 +149,185 @@ async function fetchWithRetry(url, options = {}, retryCount = 0) {
     }
 }
 
-// Update fetch status in the UI
-function updateFetchStatus(message) {
+// Helper function to extract cursor from URL
+function extractCursorFromUrl(url) {
+    try {
+        const urlObj = new URL(url);
+        return urlObj.searchParams.get('after') || urlObj.searchParams.get('before');
+    } catch (e) {
+        return null;
+    }
+}
+
+// Implement fallback strategies when a cursor consistently fails
+async function fetchWithFallbackStrategy(url, options, failedCursor) {
+    console.log(`Implementing fallback strategy for cursor: ${failedCursor}`);
+    updateFetchStatus(`Using alternative fetch strategy for problematic cursor...`);
+    
+    // Strategy 1: Try with smaller batch sizes
+    for (const batchSize of FETCH_CONFIG.batchSizes) {
+        if (batchSize === 50) continue; // Skip the default size which already failed
+        
+        try {
+            const smallerBatchUrl = modifyUrlParameter(url, 'first', batchSize.toString());
+            console.log(`Trying smaller batch size: ${batchSize}`);
+            updateFetchStatus(`Trying with smaller batch size: ${batchSize}...`);
+            
+            const response = await fetch(smallerBatchUrl, options);
+            if (response.ok) {
+                console.log(`Successfully fetched with batch size: ${batchSize}`);
+                clearFetchStatus();
+                return response;
+            }
+        } catch (error) {
+            console.warn(`Failed with batch size ${batchSize}:`, error);
+        }
+    }
+    
+    // Strategy 2: Skip the problematic cursor and generate a new one
+    try {
+        console.log("Attempting to skip problematic cursor...");
+        updateFetchStatus("Skipping problematic cursor and generating new fetch point...");
+        
+        // Generate a new cursor by fetching a small batch before the problematic one
+        const skipUrl = modifyUrlForSkippingCursor(url, failedCursor);
+        const skipResponse = await fetch(skipUrl, options);
+        
+        if (skipResponse.ok) {
+            const skipData = await skipResponse.json();
+            // Extract new pagination info to continue from
+            if (skipData.projects && skipData.projects.data && skipData.projects.data.length > 0) {
+                clearFetchStatus();
+                // Mark that we're skipping over potential data
+                updateFetchStatus("Warning: Some projects may have been skipped due to server errors", true);
+                return skipResponse;
+            }
+        }
+    } catch (error) {
+        console.warn("Failed to generate skip cursor:", error);
+    }
+    
+    // Strategy 3: Alternative approach - shift fetch window
+    try {
+        console.log("Attempting alternative fetch window...");
+        updateFetchStatus("Trying alternative approach...");
+        
+        // Try using 'before' parameter instead of 'after' if applicable
+        const altUrl = transformAfterToBefore(url, failedCursor);
+        if (altUrl !== url) {
+            const altResponse = await fetch(altUrl, options);
+            if (altResponse.ok) {
+                clearFetchStatus();
+                // Alert that we're using a different approach
+                updateFetchStatus("Using alternative fetch pattern - some data order may be affected", true);
+                return altResponse;
+            }
+        }
+    } catch (error) {
+        console.warn("Failed alternative approach:", error);
+    }
+    
+    // If all strategies fail, return a response that the caller can handle
+    // by continuing with what we have so far
+    console.error("All fallback strategies failed for cursor:", failedCursor);
+    
+    // Create a mock response with empty data but valid structure
+    const mockResponseData = JSON.stringify({
+        projects: {
+            data: [],
+            meta: {
+                has_next_page: false,
+                has_previous_page: false,
+                start_cursor: null,
+                end_cursor: null
+            }
+        }
+    });
+    
+    const mockResponse = new Response(mockResponseData, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+    });
+    
+    updateFetchStatus("Error fetching some data. Continuing with partial results.", true);
+    return mockResponse;
+}
+
+// Helper to modify URL parameters
+function modifyUrlParameter(url, param, value) {
+    try {
+        const urlObj = new URL(url);
+        urlObj.searchParams.set(param, value);
+        return urlObj.toString();
+    } catch (e) {
+        return url;
+    }
+}
+
+// Helper to modify URL for skipping a problematic cursor
+function modifyUrlForSkippingCursor(url, failedCursor) {
+    try {
+        const urlObj = new URL(url);
+        
+        // Remove the after parameter
+        urlObj.searchParams.delete('after');
+        
+        // Try to generate a new cursor by requesting a page starting from midpoint
+        // This is a heuristic approach to try to skip the problematic area
+        urlObj.searchParams.set('first', '5');
+        
+        // If we have a cursor format that's base64 JSON, try decoding and modifying
+        if (failedCursor && failedCursor.includes('eyJ')) {
+            try {
+                // This is a common format where the cursor is a base64 encoded JSON
+                const decoded = JSON.parse(atob(failedCursor));
+                
+                // If it has a timestamp, adjust it slightly backward
+                if (decoded.at) {
+                    const date = new Date(decoded.at);
+                    date.setSeconds(date.getSeconds() - 5);
+                    decoded.at = date.toISOString();
+                    
+                    // Encode back to base64 and add as new cursor
+                    const newCursor = btoa(JSON.stringify(decoded));
+                    urlObj.searchParams.set('before', newCursor);
+                }
+            } catch (e) {
+                console.warn("Failed to decode cursor for modification:", e);
+            }
+        }
+        
+        return urlObj.toString();
+    } catch (e) {
+        return url;
+    }
+}
+
+// Helper to transform an 'after' cursor to a 'before' cursor approach
+function transformAfterToBefore(url, failedCursor) {
+    try {
+        const urlObj = new URL(url);
+        
+        // Check if we're using 'after' pagination
+        if (urlObj.searchParams.has('after')) {
+            urlObj.searchParams.delete('after');
+            
+            // Set a generous 'first' parameter
+            urlObj.searchParams.set('first', '100');
+            
+            // We don't have a valid 'before' cursor here, so we're essentially
+            // starting a new fetch sequence from a different angle
+            return urlObj.toString();
+        }
+        
+        return url;
+    } catch (e) {
+        return url;
+    }
+}
+
+// Update fetch status in the UI with option for persistent notifications
+function updateFetchStatus(message, persistent = false) {
     // Check if status element exists, create if not
     let statusElement = document.querySelector('.fetch-status');
     if (!statusElement) {
@@ -124,6 +338,13 @@ function updateFetchStatus(message) {
     
     statusElement.textContent = message;
     statusElement.style.display = 'block';
+    
+    // Add a class for persistent warnings
+    if (persistent) {
+        statusElement.classList.add('persistent-warning');
+    } else {
+        statusElement.classList.remove('persistent-warning');
+    }
 }
 
 // Clear fetch status from UI
@@ -799,8 +1020,122 @@ async function loadProjects() {
         progressElement.textContent = `Loading projects (${userProjects.length})...`;
         progressElement.classList.add('from-api');
         
-        // Fetch remaining pages with retry logic
+        // Track failed pagination points
+        const failedPaginationPoints = new Set();
+        let consecutiveFailures = 0;
+        
+        // Fetch remaining pages with retry logic and fallback strategies
         while (hasNextPage && afterCursor) {
+            // If we've already failed at this cursor, try skipping it
+            if (failedPaginationPoints.has(afterCursor) && consecutiveFailures >= 2) {
+                console.warn(`Skipping problematic cursor: ${afterCursor}`);
+                updateFetchStatus(`Skipping problematic pagination point...`);
+                
+                // Try to adjust the cursor slightly to bypass the problematic point
+                try {
+                    // Decode cursor (if it's base64 encoded JSON)
+                    let decodedCursor = afterCursor;
+                    try {
+                        if (afterCursor.includes('eyJ')) {
+                            decodedCursor = JSON.parse(atob(afterCursor));
+                        }
+                    } catch (e) {
+                        console.warn("Failed to decode cursor:", e);
+                    }
+                    
+                    // Generate a slightly modified cursor or use a smaller batch size
+                    const batchSize = Math.max(5, Math.floor(50 / (consecutiveFailures + 1)));
+                    
+                    // Use the updated batch size for the next attempt
+                    let pageUrl = `/api/v1/users/${currentUser.username}/projects?first=${batchSize}`;
+                    
+                    if (typeof decodedCursor === 'object' && decodedCursor.id) {
+                        // If we can parse the cursor, create a modified version
+                        // This is assuming a specific cursor format - might need adjustment
+                        const modifiedCursor = {
+                            ...decodedCursor,
+                            // Adjust any time-based values slightly
+                            at: decodedCursor.at ? new Date(new Date(decodedCursor.at).getTime() + 1000).toISOString() : undefined
+                        };
+                        
+                        const encodedCursor = btoa(JSON.stringify(modifiedCursor));
+                        pageUrl += `&after=${encodeURIComponent(encodedCursor)}`;
+                    } else {
+                        // If we can't parse, try a different approach like limiting batch size
+                        pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
+                    }
+                    
+                    // Add other query parameters
+                    if (postedOnly) {
+                        pageUrl += '&posted=true';
+                    }
+                    
+                    if (searchQuery) {
+                        pageUrl += `&query=${encodeURIComponent(searchQuery)}`;
+                    }
+                    
+                    const pageResponse = await fetchWithRetry(pageUrl);
+                    const pageData = await pageResponse.json();
+                    
+                    if (pageData.projects && pageData.projects.data) {
+                        // If we got data with the modified approach, use it
+                        userProjects = [...userProjects, ...pageData.projects.data];
+                        hasNextPage = pageData.projects.meta.has_next_page;
+                        afterCursor = pageData.projects.meta.end_cursor;
+                        consecutiveFailures = 0; // Reset failure count on success
+                        
+                        // Update progress
+                        progressElement.textContent = `Loading projects (${userProjects.length})...`;
+                        continue;
+                    }
+                } catch (skipError) {
+                    console.error("Error while trying to skip problematic cursor:", skipError);
+                }
+                
+                // If skipping didn't work, try one more strategy: fetch from beginning with offset
+                try {
+                    console.log("Attempting alternative fetch strategy with server-side filtering...");
+                    updateFetchStatus("Trying alternative fetch strategy...");
+                    
+                    // Try to filter by project IDs to avoid pagination issues
+                    const knownIds = userProjects.map(p => p.project.id);
+                    
+                    // Fetch all projects without pagination
+                    const altUrl = `/api/v1/users/${currentUser.username}/projects?first=100`;
+                    
+                    if (postedOnly) {
+                        altUrl += '&posted=true';
+                    }
+                    
+                    if (searchQuery) {
+                        altUrl += `&query=${encodeURIComponent(searchQuery)}`;
+                    }
+                    
+                    const altResponse = await fetchWithRetry(altUrl);
+                    const altData = await altResponse.json();
+                    
+                    if (altData.projects && altData.projects.data) {
+                        // Filter out projects we already have
+                        const newProjects = altData.projects.data.filter(
+                            p => !knownIds.includes(p.project.id)
+                        );
+                        
+                        if (newProjects.length > 0) {
+                            userProjects = [...userProjects, ...newProjects];
+                            progressElement.textContent = `Loaded ${userProjects.length} projects`;
+                            updateFetchStatus("Some projects may have been missed due to server errors", true);
+                            break; // Exit the pagination loop with what we have
+                        }
+                    }
+                } catch (altError) {
+                    console.error("Alternative fetch strategy failed:", altError);
+                }
+                
+                // If all attempts fail, mark that we're moving on without some data
+                updateFetchStatus("Unable to load all projects due to server errors", true);
+                break; // Exit the pagination loop with partial data
+            }
+            
             let pageUrl = `/api/v1/users/${currentUser.username}/projects?first=50`;
             
             if (afterCursor) {
@@ -816,31 +1151,71 @@ async function loadProjects() {
                 pageUrl += `&query=${encodeURIComponent(searchQuery)}`;
             }
             
-            // Use fetchWithRetry instead of fetch
-            const pageResponse = await fetchWithRetry(pageUrl);
-            const pageData = await pageResponse.json();
-            
-            if (!pageData.projects || !pageData.projects.data) {
-                break;
+            try {
+                // Use fetchWithRetry instead of fetch
+                const pageResponse = await fetchWithRetry(pageUrl);
+                const pageData = await pageResponse.json();
+                
+                if (!pageData.projects || !pageData.projects.data) {
+                    // Track this as a failed pagination point
+                    failedPaginationPoints.add(afterCursor);
+                    consecutiveFailures++;
+                    
+                    if (consecutiveFailures >= 3) {
+                        // Too many consecutive failures, try an alternative approach
+                        console.warn(`Too many failures at cursor ${afterCursor}, trying alternative approach...`);
+                        continue; // This will trigger the skip logic above
+                    }
+                    
+                    throw new Error("Invalid response format from server");
+                }
+                
+                // Reset consecutive failures on success
+                consecutiveFailures = 0;
+                
+                // Add new projects to our array
+                userProjects = [...userProjects, ...pageData.projects.data];
+                
+                // Update progress indicator
+                progressElement.textContent = `Loading projects (${userProjects.length})...`;
+                
+                // Check if there are more pages
+                hasNextPage = pageData.projects.meta.has_next_page;
+                afterCursor = pageData.projects.meta.end_cursor;
+            } catch (pageError) {
+                console.error("Error fetching projects page:", pageError);
+                
+                // Track this as a failed pagination point
+                failedPaginationPoints.add(afterCursor);
+                consecutiveFailures++;
+                
+                if (consecutiveFailures >= 3) {
+                    // If too many consecutive failures, try to skip to the next segment
+                    // This will be handled in the next loop iteration
+                    console.warn(`Too many consecutive failures at cursor ${afterCursor}`);
+                    updateFetchStatus("Having trouble with some data, trying alternative approaches...");
+                } else {
+                    // For fewer failures, just retry with the same cursor
+                    console.warn(`Failure at cursor ${afterCursor}, will retry`);
+                }
             }
-            
-            // Add new projects to our array
-            userProjects = [...userProjects, ...pageData.projects.data];
-            
-            // Update progress indicator
-            progressElement.textContent = `Loading projects (${userProjects.length})...`;
-            
-            // Check if there are more pages
-            hasNextPage = pageData.projects.meta.has_next_page;
-            afterCursor = pageData.projects.meta.end_cursor;
         }
         
-        // Cache the new results
-        saveToLocalCache(localCacheKey, userProjects);
-        await saveProjectsToDbCache(currentUser.username, userProjects, postedFilter, searchQuery);
+        // Cache the new results, even if potentially incomplete
+        if (userProjects.length > 0) {
+            saveToLocalCache(localCacheKey, userProjects);
+            await saveProjectsToDbCache(currentUser.username, userProjects, postedFilter, searchQuery);
+        }
         
         renderProjects();
-        progressElement.textContent = `Loaded ${userProjects.length} projects`;
+        
+        if (failedPaginationPoints.size > 0) {
+            progressElement.textContent = `Loaded ${userProjects.length} projects (some may be missing)`;
+            progressElement.classList.add('partial-data');
+        } else {
+            progressElement.textContent = `Loaded ${userProjects.length} projects`;
+        }
+        
         setTimeout(() => progressElement.remove(), 1000);
         
     } catch (error) {

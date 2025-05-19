@@ -7,6 +7,7 @@
     --border-color: #e1e4e8;
     --highlight-color: #ffbe0b;
     --success-color: #06d6a0;
+    --warning-color: #ff9914;
 }
 
 * {
@@ -385,6 +386,15 @@ canvas {
     background: linear-gradient(90deg, #e53935, #b71c1c);
 }
 
+.loading-progress.partial-data {
+    background-color: #fff3e0;
+    color: #e65100;
+}
+
+.loading-progress.partial-data::after {
+    background: linear-gradient(90deg, #ff9800, #e65100);
+}
+
 @keyframes loading-progress {
     0% {
         width: 0;
@@ -426,9 +436,15 @@ canvas {
     animation: spin 1s linear infinite;
 }
 
-@keyframes spin {
-    from { transform: rotate(0deg); }
-    to { transform: rotate(360deg); }
+.fetch-status.persistent-warning {
+    background-color: #ffeacc;
+    color: #e65100;
+    border-left: 4px solid #ff9800;
+}
+
+.fetch-status.persistent-warning::before {
+    border-color: #ff9800;
+    border-top-color: transparent;
 }
 
 .error-message {
