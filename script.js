@@ -3,6 +3,7 @@ let currentUser = null;
 let userProjects = [];
 let userFollowers = [];
 let userFollowing = [];
+let isLoadingMore = false;
 
 // Initialize the app
 async function init() {
@@ -118,7 +119,7 @@ function formatNumber(num) {
     return num;
 }
 
-// Load projects
+// Load projects with pagination to get ALL projects
 async function loadProjects() {
     const projectsContainer = document.getElementById('projects-container');
     projectsContainer.innerHTML = '<div class="loading">Loading projects...</div>';
@@ -127,25 +128,12 @@ async function loadProjects() {
         const postedOnly = document.getElementById('posted-only').checked;
         const searchQuery = document.getElementById('search-input').value.trim();
         
-        let url = `/api/v1/users/${currentUser.username}/projects?first=100`;
+        // Reset projects array
+        userProjects = [];
         
-        if (postedOnly) {
-            url += '&posted=true';
-        }
+        // Fetch all projects using pagination
+        await fetchAllProjects(postedOnly, searchQuery);
         
-        if (searchQuery) {
-            url += `&query=${encodeURIComponent(searchQuery)}`;
-        }
-        
-        const response = await fetch(url);
-        const projectsData = await response.json();
-        
-        if (!projectsData.projects || !projectsData.projects.data) {
-            projectsContainer.innerHTML = '<div class="no-results">No projects found</div>';
-            return;
-        }
-        
-        userProjects = projectsData.projects.data;
         document.getElementById('projects-count').textContent = userProjects.length;
         
         if (userProjects.length === 0) {
@@ -212,21 +200,69 @@ async function loadProjects() {
     }
 }
 
+// Fetch all projects using pagination
+async function fetchAllProjects(postedOnly, searchQuery) {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50 for efficiency
+    
+    const projectsContainer = document.getElementById('projects-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading projects (0)...';
+    projectsContainer.innerHTML = '';
+    projectsContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/projects?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        if (postedOnly) {
+            url += '&posted=true';
+        }
+        
+        if (searchQuery) {
+            url += `&query=${encodeURIComponent(searchQuery)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.projects || !data.projects.data) {
+            break;
+        }
+        
+        // Add new projects to our array
+        userProjects = [...userProjects, ...data.projects.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading projects (${userProjects.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.projects.meta.has_next_page;
+        afterCursor = data.projects.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
+        }
+    }
+}
+
 // Load followers
 async function loadFollowers() {
     const followersContainer = document.getElementById('followers-container');
     followersContainer.innerHTML = '<div class="loading">Loading followers...</div>';
     
     try {
-        const response = await fetch(`/api/v1/users/${currentUser.username}/followers?first=100`);
-        const followersData = await response.json();
+        // Reset followers array
+        userFollowers = [];
         
-        if (!followersData.followers || !followersData.followers.data) {
-            followersContainer.innerHTML = '<div class="no-results">No followers found</div>';
-            return;
-        }
-        
-        userFollowers = followersData.followers.data;
+        // Fetch all followers using pagination
+        await fetchAllFollowers();
         
         if (userFollowers.length === 0) {
             followersContainer.innerHTML = '<div class="no-results">No followers found</div>';
@@ -258,21 +294,61 @@ async function loadFollowers() {
     }
 }
 
-// Load following
+// Fetch all followers using pagination
+async function fetchAllFollowers() {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50
+    
+    const followersContainer = document.getElementById('followers-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading followers (0)...';
+    followersContainer.innerHTML = '';
+    followersContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/followers?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.followers || !data.followers.data) {
+            break;
+        }
+        
+        // Add new followers to our array
+        userFollowers = [...userFollowers, ...data.followers.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading followers (${userFollowers.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.followers.meta.has_next_page;
+        afterCursor = data.followers.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
+        }
+    }
+}
+
+// Load following with pagination
 async function loadFollowing() {
     const followingContainer = document.getElementById('following-container');
     followingContainer.innerHTML = '<div class="loading">Loading following...</div>';
     
     try {
-        const response = await fetch(`/api/v1/users/${currentUser.username}/following?first=100`);
-        const followingData = await response.json();
+        // Reset following array
+        userFollowing = [];
         
-        if (!followingData.following || !followingData.following.data) {
-            followingContainer.innerHTML = '<div class="no-results">Not following anyone</div>';
-            return;
-        }
-        
-        userFollowing = followingData.following.data;
+        // Fetch all following using pagination
+        await fetchAllFollowing();
         
         if (userFollowing.length === 0) {
             followingContainer.innerHTML = '<div class="no-results">Not following anyone</div>';
@@ -301,6 +377,50 @@ async function loadFollowing() {
     } catch (error) {
         console.error("Error loading following:", error);
         followingContainer.innerHTML = '<div class="error">Failed to load following</div>';
+    }
+}
+
+// Fetch all following using pagination
+async function fetchAllFollowing() {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50
+    
+    const followingContainer = document.getElementById('following-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading following (0)...';
+    followingContainer.innerHTML = '';
+    followingContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/following?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.following || !data.following.data) {
+            break;
+        }
+        
+        // Add new following to our array
+        userFollowing = [...userFollowing, ...data.following.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading following (${userFollowing.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.following.meta.has_next_page;
+        afterCursor = data.following.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
+        }
     }
 }
 
@@ -470,4 +590,3 @@ function showError(message) {
 
 // Initialize the app when page loads
 window.addEventListener('DOMContentLoaded', init);
-

@@ -332,6 +332,45 @@ canvas {
     font-weight: 600;
 }
 
+/* Loading Progress Indicator */
+.loading-progress {
+    padding: 2rem;
+    text-align: center;
+    color: #666;
+    font-weight: 500;
+    background-color: var(--card-bg);
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    margin: 1rem 0;
+    position: relative;
+}
+
+.loading-progress::after {
+    content: '';
+    height: 3px;
+    width: 50%;
+    background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    animation: loading-progress 1.5s infinite ease-in-out;
+    border-radius: 0 3px 3px 0;
+}
+
+@keyframes loading-progress {
+    0% {
+        width: 0;
+        left: 0;
+    }
+    50% {
+        width: 70%;
+    }
+    100% {
+        width: 0;
+        left: 100%;
+    }
+}
+
 /* Loading State */
 .loading {
     padding: 2rem;
@@ -368,4 +407,3 @@ canvas {
         grid-template-columns: 1fr;
     }
 }
-
