@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Profile</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header class="profile-header">
+            <div id="profile-info" class="profile-info">
+                <div class="avatar-container">
+                    <img id="avatar" src="" alt="Profile Avatar" class="avatar">
+                </div>
+                <div class="user-details">
+                    <h1 id="username"></h1>
+                    <p id="description" class="bio"></p>
+                    <div class="stats-container">
+                        <div class="stat">
+                            <span id="followers-count">0</span>
+                            <span>Followers</span>
+                        </div>
+                        <div class="stat">
+                            <span id="following-count">0</span>
+                            <span>Following</span>
+                        </div>
+                        <div class="stat">
+                            <span id="projects-count">0</span>
+                            <span>Projects</span>
+                        </div>
+                        <div class="stat">
+                            <span id="total-views">0</span>
+                            <span>Views</span>
+                        </div>
+                        <div class="stat">
+                            <span id="total-likes">0</span>
+                            <span>Likes</span>
+                        </div>
+                    </div>
+                    <a href="https://sonauto.ai/artist/api" target="_blank" class="music-profile-btn">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M12 3V13.5M12 13.5C12 14.8807 10.8807 16 9.5 16C8.11929 16 7 14.8807 7 13.5C7 12.1193 8.11929 11 9.5 11C10.8807 11 12 12.1193 12 13.5ZM18.5 7.5V15.5C18.5 16.8807 17.3807 18 16 18C14.6193 18 13.5 16.8807 13.5 15.5C13.5 14.1193 14.6193 13 16 13C16.4 13 16.7889 13.0776 17.1414 13.2195M8 7H16" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        My Music Profile
+                    </a>
+                </div>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab-btn active" data-tab="projects">Projects</button>
+            <button class="tab-btn" data-tab="followers">Followers</button>
+            <button class="tab-btn" data-tab="following">Following</button>
+            <button class="tab-btn" data-tab="analytics">Analytics</button>
+        </nav>
+
+        <div class="search-container">
+            <input type="text" id="search-input" placeholder="Search projects...">
+            <div class="filter-options">
+                <label>
+                    <input type="checkbox" id="posted-only" checked>
+                    Posted only
+                </label>
+            </div>
+        </div>
+
+        <main>
+            <section id="projects" class="tab-content active">
+                <div class="projects-container" id="projects-container">
+                    <!-- Projects will be loaded here -->
+                    <div class="loading">Loading projects...</div>
+                </div>
+            </section>
+
+            <section id="followers" class="tab-content">
+                <div class="users-container" id="followers-container">
+                    <!-- Followers will be loaded here -->
+                    <div class="loading">Loading followers...</div>
+                </div>
+            </section>
+
+            <section id="following" class="tab-content">
+                <div class="users-container" id="following-container">
+                    <!-- Following will be loaded here -->
+                    <div class="loading">Loading following...</div>
+                </div>
+            </section>
+
+            <section id="analytics" class="tab-content">
+                <div class="analytics-container">
+                    <div class="analytics-card">
+                        <h3>Views Over Time</h3>
+                        <canvas id="views-chart"></canvas>
+                    </div>
+                    <div class="analytics-card">
+                        <h3>Most Viewed Projects</h3>
+                        <div id="top-projects">
+                            <!-- Top projects will be loaded here -->
+                            <div class="loading">Loading analytics...</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="script.js"></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
