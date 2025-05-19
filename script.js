@@ -217,7 +217,7 @@ function formatNumber(num) {
     return num;
 }
 
-// Load projects with cache support
+// Load projects with improved cache validation
 async function loadProjects() {
     const projectsContainer = document.getElementById('projects-container');
     projectsContainer.innerHTML = '<div class="loading">Loading projects...</div>';
@@ -232,39 +232,144 @@ async function loadProjects() {
         // Create cache keys
         const localCacheKey = `projects_${currentUser.username}_${postedOnly}_${searchQuery || 'all'}`;
         
-        // Try to load from localStorage first (fastest)
+        // Progress indicator
+        let progressElement = document.createElement('div');
+        progressElement.className = 'loading-progress';
+        progressElement.textContent = 'Loading projects...';
+        projectsContainer.innerHTML = '';
+        projectsContainer.appendChild(progressElement);
+        
+        // Get cached data (will check later if it's valid)
         const localCachedProjects = getFromLocalCache(localCacheKey, CACHE_CONFIG.projectsLocalExpiry);
-        
-        if (localCachedProjects) {
-            console.log("Loading projects from localStorage cache");
-            userProjects = localCachedProjects;
-            renderProjects();
-            return;
-        }
-        
-        // If not in localStorage, try database cache
         const dbCachedProjects = await getProjectsFromDbCache(currentUser.username, postedOnly, searchQuery);
         
-        if (dbCachedProjects) {
-            console.log("Loading projects from database cache");
-            userProjects = dbCachedProjects;
+        // First fetch a small batch from API (to compare with cache)
+        const initialBatchSize = 10;
+        let url = `/api/v1/users/${currentUser.username}/projects?first=${initialBatchSize}`;
+        
+        if (postedOnly) {
+            url += '&posted=true';
+        }
+        
+        if (searchQuery) {
+            url += `&query=${encodeURIComponent(searchQuery)}`;
+        }
+        
+        console.log("Fetching initial batch to validate cache");
+        progressElement.textContent = 'Validating cache...';
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.projects || !data.projects.data) {
+            throw new Error("Failed to fetch projects data");
+        }
+        
+        // Get initial projects from API
+        const initialProjects = data.projects.data;
+        
+        // Check if we should use cached data
+        let shouldUseCachedData = false;
+        let cachedData = null;
+        
+        // Function to check if cached data is still valid by comparing with initial fetch
+        function isCacheValid(cache) {
+            if (!cache || cache.length < initialProjects.length) return false;
             
-            // Also update localStorage for faster access next time
+            // Compare first few projects
+            for (let i = 0; i < initialProjects.length; i++) {
+                const apiProject = initialProjects[i];
+                const cachedProject = cache[i];
+                
+                // Compare project IDs and updated timestamps
+                if (!cachedProject || 
+                    apiProject.project.id !== cachedProject.project.id || 
+                    apiProject.project.updated_at !== cachedProject.project.updated_at) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        // First check localStorage cache (faster)
+        if (localCachedProjects && isCacheValid(localCachedProjects)) {
+            console.log("Using valid localStorage cache");
+            shouldUseCachedData = true;
+            cachedData = localCachedProjects;
+        }
+        // Then check database cache
+        else if (dbCachedProjects && isCacheValid(dbCachedProjects)) {
+            console.log("Using valid database cache");
+            shouldUseCachedData = true;
+            cachedData = dbCachedProjects;
+            
+            // Update localStorage for faster access next time
             saveToLocalCache(localCacheKey, dbCachedProjects);
-            
+        }
+        
+        // If cache is valid, use it
+        if (shouldUseCachedData && cachedData) {
+            console.log("Cache validated, using cached data");
+            userProjects = cachedData;
             renderProjects();
+            progressElement.textContent = `Loaded ${userProjects.length} projects from cache`;
+            setTimeout(() => progressElement.remove(), 1000);
             return;
         }
         
-        // If not cached, fetch from API
-        console.log("Fetching projects from API");
-        await fetchAllProjects(postedOnly, searchQuery);
+        // If cache is not valid, fetch all data from API
+        console.log("Cache not valid, fetching all data from API");
+        userProjects = initialProjects;
         
-        // Cache the results for future use
+        // Continue fetching if there are more pages
+        let hasNextPage = data.projects.meta.has_next_page;
+        let afterCursor = data.projects.meta.end_cursor;
+        
+        progressElement.textContent = `Loading projects (${userProjects.length})...`;
+        
+        // Fetch remaining pages
+        while (hasNextPage && afterCursor) {
+            let pageUrl = `/api/v1/users/${currentUser.username}/projects?first=50`;
+            
+            if (afterCursor) {
+                pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
+            }
+            
+            if (postedOnly) {
+                pageUrl += '&posted=true';
+            }
+            
+            if (searchQuery) {
+                pageUrl += `&query=${encodeURIComponent(searchQuery)}`;
+            }
+            
+            const pageResponse = await fetch(pageUrl);
+            const pageData = await pageResponse.json();
+            
+            if (!pageData.projects || !pageData.projects.data) {
+                break;
+            }
+            
+            // Add new projects to our array
+            userProjects = [...userProjects, ...pageData.projects.data];
+            
+            // Update progress indicator
+            progressElement.textContent = `Loading projects (${userProjects.length})...`;
+            
+            // Check if there are more pages
+            hasNextPage = pageData.projects.meta.has_next_page;
+            afterCursor = pageData.projects.meta.end_cursor;
+        }
+        
+        // Cache the new results
         saveToLocalCache(localCacheKey, userProjects);
         saveProjectsToDbCache(currentUser.username, userProjects, postedOnly, searchQuery);
         
         renderProjects();
+        progressElement.textContent = `Loaded ${userProjects.length} projects`;
+        setTimeout(() => progressElement.remove(), 1000);
+        
     } catch (error) {
         console.error("Error loading projects:", error);
         projectsContainer.innerHTML = '<div class="error">Failed to load projects</div>';
@@ -337,59 +442,7 @@ function renderProjects() {
     }
 }
 
-// Fetch all projects using pagination
-async function fetchAllProjects(postedOnly, searchQuery) {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const limit = 50; // Fetch in batches of 50 for efficiency
-    
-    const projectsContainer = document.getElementById('projects-container');
-    let progressElement = document.createElement('div');
-    progressElement.className = 'loading-progress';
-    progressElement.textContent = 'Loading projects (0)...';
-    projectsContainer.innerHTML = '';
-    projectsContainer.appendChild(progressElement);
-    
-    while (hasNextPage) {
-        let url = `/api/v1/users/${currentUser.username}/projects?first=${limit}`;
-        
-        if (afterCursor) {
-            url += `&after=${encodeURIComponent(afterCursor)}`;
-        }
-        
-        if (postedOnly) {
-            url += '&posted=true';
-        }
-        
-        if (searchQuery) {
-            url += `&query=${encodeURIComponent(searchQuery)}`;
-        }
-        
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        if (!data.projects || !data.projects.data) {
-            break;
-        }
-        
-        // Add new projects to our array
-        userProjects = [...userProjects, ...data.projects.data];
-        
-        // Update progress indicator
-        progressElement.textContent = `Loading projects (${userProjects.length})...`;
-        
-        // Check if there are more pages
-        hasNextPage = data.projects.meta.has_next_page;
-        afterCursor = data.projects.meta.end_cursor;
-        
-        // If no more pages or no cursor, break the loop
-        if (!hasNextPage || !afterCursor) {
-            break;
-        }
-    }
-}
-
-// Load followers with cache support
+// Load followers with improved cache validation
 async function loadFollowers() {
     const followersContainer = document.getElementById('followers-container');
     followersContainer.innerHTML = '<div class="loading">Loading followers...</div>';
@@ -401,24 +454,108 @@ async function loadFollowers() {
         // Create cache key
         const cacheKey = `followers_${currentUser.username}`;
         
-        // Try to load from localStorage
+        // Progress indicator
+        let progressElement = document.createElement('div');
+        progressElement.className = 'loading-progress';
+        progressElement.textContent = 'Loading followers...';
+        followersContainer.innerHTML = '';
+        followersContainer.appendChild(progressElement);
+        
+        // Get cached data
         const cachedFollowers = getFromLocalCache(cacheKey, CACHE_CONFIG.followersExpiry);
         
-        if (cachedFollowers) {
-            console.log("Loading followers from cache");
+        // First fetch a small batch from API (to compare with cache)
+        const initialBatchSize = 10;
+        let url = `/api/v1/users/${currentUser.username}/followers?first=${initialBatchSize}`;
+        
+        console.log("Fetching initial followers batch to validate cache");
+        progressElement.textContent = 'Validating cache...';
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.followers || !data.followers.data) {
+            throw new Error("Failed to fetch followers data");
+        }
+        
+        // Get initial followers from API
+        const initialFollowers = data.followers.data;
+        
+        // Check if we should use cached data
+        let shouldUseCachedData = false;
+        
+        // Function to check if cached data is still valid
+        function isCacheValid(cache) {
+            if (!cache || cache.length < initialFollowers.length) return false;
+            
+            // Compare first few followers
+            for (let i = 0; i < initialFollowers.length; i++) {
+                const apiFollower = initialFollowers[i];
+                const cachedFollower = cache[i];
+                
+                if (!cachedFollower || 
+                    apiFollower.follow.user.id !== cachedFollower.follow.user.id || 
+                    apiFollower.cursor !== cachedFollower.cursor) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        // Check if cache is valid
+        if (cachedFollowers && isCacheValid(cachedFollowers)) {
+            console.log("Using valid followers cache");
             userFollowers = cachedFollowers;
             renderFollowers();
+            progressElement.textContent = `Loaded ${userFollowers.length} followers from cache`;
+            setTimeout(() => progressElement.remove(), 1000);
             return;
         }
         
-        // If not cached, fetch from API
-        console.log("Fetching followers from API");
-        await fetchAllFollowers();
+        // If cache is not valid, fetch all data from API
+        console.log("Followers cache not valid, fetching all data from API");
+        userFollowers = initialFollowers;
         
-        // Cache the results
+        // Continue fetching if there are more pages
+        let hasNextPage = data.followers.meta.has_next_page;
+        let afterCursor = data.followers.meta.end_cursor;
+        
+        progressElement.textContent = `Loading followers (${userFollowers.length})...`;
+        
+        // Fetch remaining pages
+        while (hasNextPage && afterCursor) {
+            let pageUrl = `/api/v1/users/${currentUser.username}/followers?first=50`;
+            
+            if (afterCursor) {
+                pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
+            }
+            
+            const pageResponse = await fetch(pageUrl);
+            const pageData = await pageResponse.json();
+            
+            if (!pageData.followers || !pageData.followers.data) {
+                break;
+            }
+            
+            // Add new followers to our array
+            userFollowers = [...userFollowers, ...pageData.followers.data];
+            
+            // Update progress indicator
+            progressElement.textContent = `Loading followers (${userFollowers.length})...`;
+            
+            // Check if there are more pages
+            hasNextPage = pageData.followers.meta.has_next_page;
+            afterCursor = pageData.followers.meta.end_cursor;
+        }
+        
+        // Cache the new results
         saveToLocalCache(cacheKey, userFollowers);
         
         renderFollowers();
+        progressElement.textContent = `Loaded ${userFollowers.length} followers`;
+        setTimeout(() => progressElement.remove(), 1000);
+        
     } catch (error) {
         console.error("Error loading followers:", error);
         followersContainer.innerHTML = '<div class="error">Failed to load followers</div>';
@@ -455,51 +592,7 @@ function renderFollowers() {
     followersContainer.innerHTML = followersHTML;
 }
 
-// Fetch all followers using pagination
-async function fetchAllFollowers() {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const limit = 50; // Fetch in batches of 50
-    
-    const followersContainer = document.getElementById('followers-container');
-    let progressElement = document.createElement('div');
-    progressElement.className = 'loading-progress';
-    progressElement.textContent = 'Loading followers (0)...';
-    followersContainer.innerHTML = '';
-    followersContainer.appendChild(progressElement);
-    
-    while (hasNextPage) {
-        let url = `/api/v1/users/${currentUser.username}/followers?first=${limit}`;
-        
-        if (afterCursor) {
-            url += `&after=${encodeURIComponent(afterCursor)}`;
-        }
-        
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        if (!data.followers || !data.followers.data) {
-            break;
-        }
-        
-        // Add new followers to our array
-        userFollowers = [...userFollowers, ...data.followers.data];
-        
-        // Update progress indicator
-        progressElement.textContent = `Loading followers (${userFollowers.length})...`;
-        
-        // Check if there are more pages
-        hasNextPage = data.followers.meta.has_next_page;
-        afterCursor = data.followers.meta.end_cursor;
-        
-        // If no more pages or no cursor, break the loop
-        if (!hasNextPage || !afterCursor) {
-            break;
-        }
-    }
-}
-
-// Load following with cache support
+// Load following with improved cache validation
 async function loadFollowing() {
     const followingContainer = document.getElementById('following-container');
     followingContainer.innerHTML = '<div class="loading">Loading following...</div>';
@@ -511,24 +604,108 @@ async function loadFollowing() {
         // Create cache key
         const cacheKey = `following_${currentUser.username}`;
         
-        // Try to load from localStorage
+        // Progress indicator
+        let progressElement = document.createElement('div');
+        progressElement.className = 'loading-progress';
+        progressElement.textContent = 'Loading following...';
+        followingContainer.innerHTML = '';
+        followingContainer.appendChild(progressElement);
+        
+        // Get cached data
         const cachedFollowing = getFromLocalCache(cacheKey, CACHE_CONFIG.followingExpiry);
         
-        if (cachedFollowing) {
-            console.log("Loading following from cache");
+        // First fetch a small batch from API (to compare with cache)
+        const initialBatchSize = 10;
+        let url = `/api/v1/users/${currentUser.username}/following?first=${initialBatchSize}`;
+        
+        console.log("Fetching initial following batch to validate cache");
+        progressElement.textContent = 'Validating cache...';
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.following || !data.following.data) {
+            throw new Error("Failed to fetch following data");
+        }
+        
+        // Get initial following from API
+        const initialFollowing = data.following.data;
+        
+        // Check if we should use cached data
+        let shouldUseCachedData = false;
+        
+        // Function to check if cached data is still valid
+        function isCacheValid(cache) {
+            if (!cache || cache.length < initialFollowing.length) return false;
+            
+            // Compare first few following
+            for (let i = 0; i < initialFollowing.length; i++) {
+                const apiFollowing = initialFollowing[i];
+                const cachedFollowing = cache[i];
+                
+                if (!cachedFollowing || 
+                    apiFollowing.follow.user.id !== cachedFollowing.follow.user.id || 
+                    apiFollowing.cursor !== cachedFollowing.cursor) {
+                    return false;
+                }
+            }
+            
+            return true;
+        }
+        
+        // Check if cache is valid
+        if (cachedFollowing && isCacheValid(cachedFollowing)) {
+            console.log("Using valid following cache");
             userFollowing = cachedFollowing;
             renderFollowing();
+            progressElement.textContent = `Loaded ${userFollowing.length} following from cache`;
+            setTimeout(() => progressElement.remove(), 1000);
             return;
         }
         
-        // If not cached, fetch from API
-        console.log("Fetching following from API");
-        await fetchAllFollowing();
+        // If cache is not valid, fetch all data from API
+        console.log("Following cache not valid, fetching all data from API");
+        userFollowing = initialFollowing;
         
-        // Cache the results
+        // Continue fetching if there are more pages
+        let hasNextPage = data.following.meta.has_next_page;
+        let afterCursor = data.following.meta.end_cursor;
+        
+        progressElement.textContent = `Loading following (${userFollowing.length})...`;
+        
+        // Fetch remaining pages
+        while (hasNextPage && afterCursor) {
+            let pageUrl = `/api/v1/users/${currentUser.username}/following?first=50`;
+            
+            if (afterCursor) {
+                pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
+            }
+            
+            const pageResponse = await fetch(pageUrl);
+            const pageData = await pageResponse.json();
+            
+            if (!pageData.following || !pageData.following.data) {
+                break;
+            }
+            
+            // Add new following to our array
+            userFollowing = [...userFollowing, ...pageData.following.data];
+            
+            // Update progress indicator
+            progressElement.textContent = `Loading following (${userFollowing.length})...`;
+            
+            // Check if there are more pages
+            hasNextPage = pageData.following.meta.has_next_page;
+            afterCursor = pageData.following.meta.end_cursor;
+        }
+        
+        // Cache the new results
         saveToLocalCache(cacheKey, userFollowing);
         
         renderFollowing();
+        progressElement.textContent = `Loaded ${userFollowing.length} following`;
+        setTimeout(() => progressElement.remove(), 1000);
+        
     } catch (error) {
         console.error("Error loading following:", error);
         followingContainer.innerHTML = '<div class="error">Failed to load following</div>';
@@ -563,50 +740,6 @@ function renderFollowing() {
     });
     
     followingContainer.innerHTML = followingHTML;
-}
-
-// Fetch all following using pagination
-async function fetchAllFollowing() {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const limit = 50; // Fetch in batches of 50
-    
-    const followingContainer = document.getElementById('following-container');
-    let progressElement = document.createElement('div');
-    progressElement.className = 'loading-progress';
-    progressElement.textContent = 'Loading following (0)...';
-    followingContainer.innerHTML = '';
-    followingContainer.appendChild(progressElement);
-    
-    while (hasNextPage) {
-        let url = `/api/v1/users/${currentUser.username}/following?first=${limit}`;
-        
-        if (afterCursor) {
-            url += `&after=${encodeURIComponent(afterCursor)}`;
-        }
-        
-        const response = await fetch(url);
-        const data = await response.json();
-        
-        if (!data.following || !data.following.data) {
-            break;
-        }
-        
-        // Add new following to our array
-        userFollowing = [...userFollowing, ...data.following.data];
-        
-        // Update progress indicator
-        progressElement.textContent = `Loading following (${userFollowing.length})...`;
-        
-        // Check if there are more pages
-        hasNextPage = data.following.meta.has_next_page;
-        afterCursor = data.following.meta.end_cursor;
-        
-        // If no more pages or no cursor, break the loop
-        if (!hasNextPage || !afterCursor) {
-            break;
-        }
-    }
 }
 
 // Load analytics with cache support
