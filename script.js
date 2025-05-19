@@ -130,6 +130,12 @@ async function initializeWebsimSocket() {
                         const originalCreate = collection.create;
                         collection.create = async function(data) {
                             try {
+                                // Preemptively check data size and use chunking if needed
+                                const dataSize = JSON.stringify(data).length;
+                                if (dataSize > MAX_CHUNK_SIZE * 0.8) { // Use 80% threshold to be safe
+                                    console.warn(`Data size (${dataSize} bytes) approaching limit. Using chunking strategy preemptively.`);
+                                    return await chunkAndStore(collectionName, data);
+                                }
                                 return await originalCreate.call(this, data);
                             } catch (error) {
                                 if (error.message && error.message.includes('Message is too large') || 
@@ -338,7 +344,7 @@ function getFromLocalCache(key, expiryTime) {
 }
 
 // Save projects data to database cache with retry logic and chunking support
-async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery) {
+async function saveProjectsToDbCache(username, projects, postedFilter, searchQuery) {
     const maxRetries = 3;
     let retryCount = 0;
     
@@ -349,13 +355,14 @@ async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery
                 await initializeWebsimSocket();
             }
             
-            const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+            // Include postedFilter in the cache key - can be true, false, or null
+            const cacheKey = `projects_${postedFilter !== null ? postedFilter : 'all'}_${searchQuery || 'all'}`;
             
             // Check the size of the data to decide if we need chunking
             const dataSize = JSON.stringify(projects).length;
             
-            if (dataSize > MAX_CHUNK_SIZE) {
-                console.log(`Large cache data detected (${dataSize} bytes), using chunking strategy`);
+            if (dataSize > MAX_CHUNK_SIZE * 0.8) { // Use 80% threshold to be safe
+                console.log(`Large cache data detected (${dataSize} bytes), using chunking strategy preemptively`);
                 const result = await chunkAndStore('profile_cache', {
                     username: username,
                     cache_key: cacheKey,
@@ -408,7 +415,7 @@ async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery
 }
 
 // Get projects from database cache with support for chunked data
-async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
+async function getProjectsFromDbCache(username, postedFilter, searchQuery) {
     const maxRetries = 3;
     let retryCount = 0;
     
@@ -419,7 +426,8 @@ async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
                 await initializeWebsimSocket();
             }
             
-            const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+            // Include postedFilter in the cache key - can be true, false, or null
+            const cacheKey = `projects_${postedFilter !== null ? postedFilter : 'all'}_${searchQuery || 'all'}`;
             
             // First check if we have a reference to chunked data
             const chunkReferences = room.collection('profile_cache_references')
@@ -541,6 +549,10 @@ async function loadUserProfile(username) {
 async function loadUserStats(username) {
     try {
         const response = await fetch(`/api/v1/users/${username}/stats`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch user stats: ${response.status} ${response.statusText}`);
+        }
+        
         const statsData = await response.json();
         
         if (statsData.stats) {
@@ -549,6 +561,7 @@ async function loadUserStats(username) {
         }
     } catch (error) {
         console.error("Error loading user stats:", error);
+        // Continue despite stats error - don't show a fatal error for this
     }
 }
 
@@ -556,6 +569,10 @@ async function loadUserStats(username) {
 async function loadFollowerCount(username) {
     try {
         const response = await fetch(`/api/v1/users/${username}/followers?count=true`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch followers count: ${response.status} ${response.statusText}`);
+        }
+        
         const followersData = await response.json();
         
         if (followersData.followers && followersData.followers.meta) {
@@ -563,6 +580,7 @@ async function loadFollowerCount(username) {
         }
     } catch (error) {
         console.error("Error loading followers count:", error);
+        // Continue despite followers count error
     }
 }
 
@@ -570,6 +588,10 @@ async function loadFollowerCount(username) {
 async function loadFollowingCount(username) {
     try {
         const response = await fetch(`/api/v1/users/${username}/following?count=true`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch following count: ${response.status} ${response.statusText}`);
+        }
+        
         const followingData = await response.json();
         
         if (followingData.following && followingData.following.meta) {
@@ -577,6 +599,7 @@ async function loadFollowingCount(username) {
         }
     } catch (error) {
         console.error("Error loading following count:", error);
+        // Continue despite following count error
     }
 }
 
@@ -591,7 +614,7 @@ function formatNumber(num) {
     return num;
 }
 
-// Load projects with improved cache validation
+// Load projects with improved cache validation and support for unposted projects
 async function loadProjects() {
     const projectsContainer = document.getElementById('projects-container');
     projectsContainer.innerHTML = '<div class="loading">Loading projects...</div>';
@@ -603,8 +626,9 @@ async function loadProjects() {
         // Reset projects array
         userProjects = [];
         
-        // Create cache keys
-        const localCacheKey = `projects_${currentUser.username}_${postedOnly}_${searchQuery || 'all'}`;
+        // Create cache keys - properly handle the postedOnly flag
+        const postedFilter = postedOnly ? true : null; // null means "all projects" (both posted and unposted)
+        const localCacheKey = `projects_${currentUser.username}_${postedFilter !== null ? postedFilter : 'all'}_${searchQuery || 'all'}`;
         
         // Progress indicator
         let progressElement = document.createElement('div');
@@ -615,12 +639,13 @@ async function loadProjects() {
         
         // Get cached data (will check later if it's valid)
         const localCachedProjects = getFromLocalCache(localCacheKey, CACHE_CONFIG.projectsLocalExpiry);
-        const dbCachedProjects = await getProjectsFromDbCache(currentUser.username, postedOnly, searchQuery);
+        const dbCachedProjects = await getProjectsFromDbCache(currentUser.username, postedFilter, searchQuery);
         
         // First fetch a small batch from API (to compare with cache)
         const initialBatchSize = 10;
         let url = `/api/v1/users/${currentUser.username}/projects?first=${initialBatchSize}`;
         
+        // Only add posted=true parameter if postedOnly is true
         if (postedOnly) {
             url += '&posted=true';
         }
@@ -629,10 +654,14 @@ async function loadProjects() {
             url += `&query=${encodeURIComponent(searchQuery)}`;
         }
         
-        console.log("Fetching initial batch to validate cache");
+        console.log(`Fetching initial batch to validate cache (postedFilter: ${postedFilter})`);
         progressElement.textContent = 'Validating cache...';
         
         const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch projects: ${response.status} ${response.statusText}`);
+        }
+        
         const data = await response.json();
         
         if (!data.projects || !data.projects.data) {
@@ -671,6 +700,9 @@ async function loadProjects() {
             console.log("Using valid localStorage cache");
             shouldUseCachedData = true;
             cachedData = localCachedProjects;
+            
+            // Add cache indicator to show source
+            progressElement.classList.add('from-localStorage');
         }
         // Then check database cache
         else if (dbCachedProjects && isCacheValid(dbCachedProjects)) {
@@ -680,6 +712,9 @@ async function loadProjects() {
             
             // Update localStorage for faster access next time
             saveToLocalCache(localCacheKey, dbCachedProjects);
+            
+            // Add cache indicator to show source
+            progressElement.classList.add('from-database');
         }
         
         // If cache is valid, use it
@@ -701,6 +736,7 @@ async function loadProjects() {
         let afterCursor = data.projects.meta.end_cursor;
         
         progressElement.textContent = `Loading projects (${userProjects.length})...`;
+        progressElement.classList.add('from-api');
         
         // Fetch remaining pages
         while (hasNextPage && afterCursor) {
@@ -710,6 +746,7 @@ async function loadProjects() {
                 pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
             }
             
+            // Only add posted=true parameter if postedOnly is true
             if (postedOnly) {
                 pageUrl += '&posted=true';
             }
@@ -719,6 +756,10 @@ async function loadProjects() {
             }
             
             const pageResponse = await fetch(pageUrl);
+            if (!pageResponse.ok) {
+                throw new Error(`Failed to fetch projects page: ${pageResponse.status} ${pageResponse.statusText}`);
+            }
+            
             const pageData = await pageResponse.json();
             
             if (!pageData.projects || !pageData.projects.data) {
@@ -738,7 +779,7 @@ async function loadProjects() {
         
         // Cache the new results
         saveToLocalCache(localCacheKey, userProjects);
-        saveProjectsToDbCache(currentUser.username, userProjects, postedOnly, searchQuery);
+        await saveProjectsToDbCache(currentUser.username, userProjects, postedFilter, searchQuery);
         
         renderProjects();
         progressElement.textContent = `Loaded ${userProjects.length} projects`;
@@ -746,7 +787,7 @@ async function loadProjects() {
         
     } catch (error) {
         console.error("Error loading projects:", error);
-        projectsContainer.innerHTML = '<div class="error">Failed to load projects</div>';
+        projectsContainer.innerHTML = `<div class="error-message">Failed to load projects: ${error.message}</div>`;
     }
 }
 

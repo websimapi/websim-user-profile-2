@@ -358,6 +358,33 @@ canvas {
     border-radius: 0 3px 3px 0;
 }
 
+.loading-progress.from-localStorage {
+    background-color: #e8f5e9;
+    color: #1b5e20;
+}
+
+.loading-progress.from-localStorage::after {
+    background: linear-gradient(90deg, #43a047, #1b5e20);
+}
+
+.loading-progress.from-database {
+    background-color: #fff8e1;
+    color: #ff6f00;
+}
+
+.loading-progress.from-database::after {
+    background: linear-gradient(90deg, #ffb300, #ff6f00);
+}
+
+.loading-progress.from-api {
+    background-color: #ffebee;
+    color: #b71c1c;
+}
+
+.loading-progress.from-api::after {
+    background: linear-gradient(90deg, #e53935, #b71c1c);
+}
+
 @keyframes loading-progress {
     0% {
         width: 0;
@@ -372,41 +399,32 @@ canvas {
     }
 }
 
-/* Loading State */
-.loading {
+/* Improve error message styling */
+.error-message {
+    background-color: #ffebee;
+    color: #b71c1c;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    box-shadow: 0 2px 8px rgba(183, 28, 28, 0.2);
+    animation: fadeIn 0.3s ease-in-out;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.no-results {
     padding: 2rem;
     text-align: center;
     color: #666;
-}
-
-/* Responsive Adjustments */
-@media (max-width: 768px) {
-    .profile-info {
-        flex-direction: column;
-        align-items: center;
-        text-align: center;
-    }
-    
-    .user-details {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-    }
-    
-    .stats-container {
-        justify-content: center;
-        flex-wrap: wrap;
-    }
-    
-    .tabs {
-        overflow-x: auto;
-        white-space: nowrap;
-        padding-bottom: 0.5rem;
-    }
-    
-    .projects-container, .users-container {
-        grid-template-columns: 1fr;
-    }
+    background-color: var(--card-bg);
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
 }
 
 /* Add new styles for the clear cache button */
@@ -456,24 +474,6 @@ canvas {
 }
 
 /* Add styles for error messages and retry button */
-.error-message {
-    background-color: #ffebee;
-    color: #b71c1c;
-    padding: 1rem;
-    margin-bottom: 1rem;
-    border-radius: 8px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    box-shadow: 0 2px 8px rgba(183, 28, 28, 0.2);
-    animation: fadeIn 0.3s ease-in-out;
-}
-
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(-10px); }
-    to { opacity: 1; transform: translateY(0); }
-}
-
 .retry-button {
     background-color: #b71c1c;
     color: white;
@@ -506,4 +506,34 @@ canvas {
     0% { opacity: 0.6; }
     50% { opacity: 1; }
     100% { opacity: 0.6; }
+}
+
+/* Responsive Adjustments */
+@media (max-width: 768px) {
+    .profile-info {
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+    }
+    
+    .user-details {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    
+    .stats-container {
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+    
+    .tabs {
+        overflow-x: auto;
+        white-space: nowrap;
+        padding-bottom: 0.5rem;
+    }
+    
+    .projects-container, .users-container {
+        grid-template-columns: 1fr;
+    }
 }
