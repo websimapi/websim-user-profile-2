@@ -202,6 +202,7 @@ body {
     overflow: hidden;
     box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
     transition: transform 0.3s ease, box-shadow 0.3s ease;
+    animation: fadeIn 0.3s ease;
 }
 
 .project-card:hover {
@@ -262,6 +263,7 @@ body {
     border-radius: 12px;
     box-shadow: 0 4px 8px rgba(0, 0, 0, 0.05);
     transition: transform 0.2s ease;
+    animation: fadeIn 0.3s ease;
 }
 
 .user-card:hover {
@@ -332,50 +334,130 @@ canvas {
     font-weight: 600;
 }
 
-/* Loading Progress Indicator */
-.loading-progress {
+/* Loading bar styles */
+.loading-container {
+    width: 100%;
+    margin-bottom: 2rem;
+    background-color: var(--card-bg);
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.05);
+}
+
+.loading-bar {
+    width: 100%;
+    height: 6px;
+    background-color: rgba(0, 0, 0, 0.05);
+    border-radius: 3px;
+    margin-top: 0.75rem;
+    overflow: hidden;
+}
+
+.loading-bar-fill {
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+    border-radius: 3px;
+    transition: width 0.3s ease;
+}
+
+/* Retry button */
+.retry-btn {
+    background-color: var(--primary-color);
+    color: white;
+    border: none;
+    border-radius: 4px;
+    padding: 0.5rem 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    margin-top: 0.5rem;
+    display: inline-block;
+}
+
+.retry-btn:hover {
+    background-color: #2a75e8;
+}
+
+/* Error message enhancements */
+.error {
     padding: 2rem;
     text-align: center;
-    color: #666;
-    font-weight: 500;
-    background-color: var(--card-bg);
+    color: #e74c3c;
+    background-color: #fef5f5;
     border-radius: 8px;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
-    margin: 1rem 0;
+    border: 1px solid #fad7d7;
+    font-weight: 500;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+
+.error-message {
+    background-color: #fef5f5;
+    color: #e74c3c;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border-radius: 8px;
+    border-left: 4px solid #e74c3c;
+    font-weight: 500;
+    text-align: center;
     position: relative;
+    animation: slideDown 0.3s ease-out;
 }
 
-.loading-progress::after {
-    content: '';
-    height: 3px;
-    width: 50%;
-    background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    animation: loading-progress 1.5s infinite ease-in-out;
-    border-radius: 0 3px 3px 0;
-}
-
-@keyframes loading-progress {
-    0% {
-        width: 0;
-        left: 0;
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
     }
-    50% {
-        width: 70%;
-    }
-    100% {
-        width: 0;
-        left: 100%;
+    to {
+        opacity: 1;
+        transform: translateY(0);
     }
 }
 
-/* Loading State */
+/* Enhanced loading state with soft pulse animation */
 .loading {
     padding: 2rem;
     text-align: center;
     color: #666;
+    font-weight: 500;
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% {
+        opacity: 0.6;
+    }
+    50% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0.6;
+    }
+}
+
+/* Improve image loading */
+img[loading="lazy"] {
+    opacity: 0;
+    transition: opacity 0.3s ease;
+}
+
+img[loading="lazy"].loaded {
+    opacity: 1;
+}
+
+/* Add fade-in animation for cards */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
 }
 
 /* Responsive Adjustments */
