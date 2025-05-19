@@ -8,6 +8,8 @@ let room = null; // Will be initialized with proper error handling
 let websocketRetryCount = 0;
 const MAX_WEBSOCKET_RETRIES = 5;
 const WEBSOCKET_RETRY_DELAY = 2000; // 2 seconds
+// Maximum chunk size for WebsimSocket messages (slightly below server limit)
+const MAX_CHUNK_SIZE = 25000; // bytes
 
 // Cache configuration
 const CACHE_CONFIG = {
@@ -64,8 +66,12 @@ async function initializeWebsimSocket() {
                 handleWebsocketError(error);
             };
             
-            room.onClose = () => {
-                console.warn("WebsimSocket closed");
+            room.onClose = (event) => {
+                console.warn("WebsimSocket closed:", event?.reason);
+                if (event?.reason && event.reason.includes("Message is too large")) {
+                    console.warn("Socket closed due to large message size. Using chunking strategy for future requests.");
+                }
+                
                 if (websocketRetryCount < MAX_WEBSOCKET_RETRIES) {
                     websocketRetryCount++;
                     console.log(`Reconnecting WebsimSocket (attempt ${websocketRetryCount}/${MAX_WEBSOCKET_RETRIES})...`);
@@ -80,7 +86,7 @@ async function initializeWebsimSocket() {
                 }
             };
             
-            // Add a custom error handler for the specific enqueue error
+            // Add a custom error handler for various WebSocket errors
             const originalOnMessage = room.socket?.onmessage;
             if (room.socket && originalOnMessage) {
                 room.socket.onmessage = function(event) {
@@ -113,12 +119,161 @@ async function initializeWebsimSocket() {
                 };
             }
             
+            // Extend the collection method to handle large messages
+            if (room.collection) {
+                const originalCollection = room.collection;
+                room.collection = function(collectionName) {
+                    const collection = originalCollection.call(this, collectionName);
+                    
+                    // Wrap the create method to handle large data
+                    if (collection.create) {
+                        const originalCreate = collection.create;
+                        collection.create = async function(data) {
+                            try {
+                                return await originalCreate.call(this, data);
+                            } catch (error) {
+                                if (error.message && error.message.includes('Message is too large') || 
+                                    (error.name === 'Error' && error.message && error.message.includes('socket closed'))) {
+                                    console.warn("Message too large, using chunking strategy");
+                                    return await chunkAndStore(collectionName, data);
+                                } else {
+                                    throw error;
+                                }
+                            }
+                        };
+                    }
+                    
+                    return collection;
+                };
+            }
+            
             resolve(room);
         } catch (error) {
             console.error("Error initializing WebsimSocket:", error);
             reject(error);
         }
     });
+}
+
+// Function to chunk large data and store it in multiple records
+async function chunkAndStore(collectionName, data) {
+    try {
+        console.log("Chunking large data for storage");
+        
+        // Generate a unique ID for this chunked dataset
+        const chunkGroupId = 'chunk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 15);
+        
+        // Convert data to string if it's not already
+        const dataString = typeof data === 'string' ? data : JSON.stringify(data);
+        
+        // Calculate number of chunks needed
+        const numberOfChunks = Math.ceil(dataString.length / MAX_CHUNK_SIZE);
+        console.log(`Splitting data into ${numberOfChunks} chunks`);
+        
+        // Store metadata first
+        await room.collection(`${collectionName}_chunks`).create({
+            chunk_group_id: chunkGroupId,
+            total_chunks: numberOfChunks,
+            is_metadata: true,
+            original_type: typeof data,
+            timestamp: new Date().toISOString()
+        });
+        
+        // Store each chunk with retry logic
+        for (let i = 0; i < numberOfChunks; i++) {
+            const startPos = i * MAX_CHUNK_SIZE;
+            const endPos = Math.min((i + 1) * MAX_CHUNK_SIZE, dataString.length);
+            const chunkData = dataString.substring(startPos, endPos);
+            
+            let retries = 0;
+            const maxRetries = 3;
+            let success = false;
+            
+            while (!success && retries < maxRetries) {
+                try {
+                    await room.collection(`${collectionName}_chunks`).create({
+                        chunk_group_id: chunkGroupId,
+                        chunk_index: i,
+                        data: chunkData,
+                        is_metadata: false
+                    });
+                    success = true;
+                } catch (chunkError) {
+                    retries++;
+                    console.warn(`Failed to store chunk ${i} (attempt ${retries}/${maxRetries}):`, chunkError);
+                    await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+                }
+            }
+            
+            if (!success) {
+                throw new Error(`Failed to store chunk ${i} after ${maxRetries} attempts`);
+            }
+        }
+        
+        console.log(`Successfully stored ${numberOfChunks} chunks with group ID: ${chunkGroupId}`);
+        
+        // Return a reference to the chunked data
+        return {
+            id: chunkGroupId,
+            _isChunked: true,
+            _collectionName: `${collectionName}_chunks`,
+            timestamp: new Date().toISOString()
+        };
+        
+    } catch (error) {
+        console.error("Error in chunkAndStore:", error);
+        throw error;
+    }
+}
+
+// Function to retrieve chunked data
+async function retrieveChunkedData(collectionName, chunkGroupId) {
+    try {
+        console.log(`Retrieving chunked data with group ID: ${chunkGroupId}`);
+        
+        // Get metadata
+        const chunks = room.collection(`${collectionName}_chunks`)
+            .filter({ chunk_group_id: chunkGroupId })
+            .getList();
+        
+        if (!chunks || chunks.length === 0) {
+            throw new Error(`No chunks found for group ID: ${chunkGroupId}`);
+        }
+        
+        // Find metadata chunk
+        const metadataChunk = chunks.find(chunk => chunk.is_metadata === true);
+        if (!metadataChunk) {
+            throw new Error(`Metadata chunk not found for group ID: ${chunkGroupId}`);
+        }
+        
+        const totalChunks = metadataChunk.total_chunks;
+        const originalType = metadataChunk.original_type;
+        
+        // Get all data chunks
+        const dataChunks = chunks.filter(chunk => chunk.is_metadata === false);
+        
+        // Sort chunks by index
+        dataChunks.sort((a, b) => a.chunk_index - b.chunk_index);
+        
+        // Ensure all chunks are present
+        if (dataChunks.length !== totalChunks) {
+            throw new Error(`Missing chunks: found ${dataChunks.length} of ${totalChunks} expected`);
+        }
+        
+        // Combine chunks
+        const combinedData = dataChunks.map(chunk => chunk.data).join('');
+        
+        // Parse if original was an object
+        if (originalType === 'object') {
+            return JSON.parse(combinedData);
+        }
+        
+        return combinedData;
+        
+    } catch (error) {
+        console.error("Error retrieving chunked data:", error);
+        throw error;
+    }
 }
 
 // Generic handler for WebSocket errors
@@ -133,10 +288,15 @@ function handleWebsocketError(error) {
                 .then(() => console.log("WebsimSocket reinitialized successfully"))
                 .catch(err => console.error("Failed to reinitialize WebsimSocket:", err));
         }
+    } else if (error.message && (error.message.includes('Message is too large') || 
+               error.message.includes('socket closed'))) {
+        console.warn("Socket error due to message size:", error.message);
+        showError("Data transfer error: Message size exceeded limits. Using alternative strategy.");
+        // The chunking strategy will be applied in the wrapped collection.create method
     }
 }
 
-// Cache Management Functions with improved error handling
+// Cache Management Functions
 // -------------------------
 
 // Check if a cache entry is expired
@@ -177,7 +337,7 @@ function getFromLocalCache(key, expiryTime) {
     }
 }
 
-// Save projects data to database cache with retry logic
+// Save projects data to database cache with retry logic and chunking support
 async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery) {
     const maxRetries = 3;
     let retryCount = 0;
@@ -190,19 +350,47 @@ async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery
             }
             
             const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
-            await room.collection('profile_cache').create({
-                username: username,
-                cache_key: cacheKey,
-                data: projects,
-                timestamp: new Date().toISOString()
-            });
-            return true;
+            
+            // Check the size of the data to decide if we need chunking
+            const dataSize = JSON.stringify(projects).length;
+            
+            if (dataSize > MAX_CHUNK_SIZE) {
+                console.log(`Large cache data detected (${dataSize} bytes), using chunking strategy`);
+                const result = await chunkAndStore('profile_cache', {
+                    username: username,
+                    cache_key: cacheKey,
+                    data: projects,
+                    timestamp: new Date().toISOString()
+                });
+                
+                // Store a reference to the chunked data
+                await room.collection('profile_cache_references').create({
+                    username: username,
+                    cache_key: cacheKey,
+                    chunk_group_id: result.id,
+                    is_chunked: true,
+                    timestamp: new Date().toISOString()
+                });
+                
+                return true;
+            } else {
+                // Regular storage for smaller data
+                await room.collection('profile_cache').create({
+                    username: username,
+                    cache_key: cacheKey,
+                    data: projects,
+                    timestamp: new Date().toISOString()
+                });
+                return true;
+            }
         } catch (error) {
             retryCount++;
             console.warn(`Failed to save to database cache (attempt ${retryCount}/${maxRetries}):`, error);
             
-            // If it's the ReadableStream error, try to reconnect
-            if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+            // If it's a socket error, try to reconnect
+            if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
+                                  error.message.includes('Message is too large') ||
+                                  error.message.includes('socket closed'))) {
                 handleWebsocketError(error);
             }
             
@@ -219,7 +407,7 @@ async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery
     return false;
 }
 
-// Get projects from database cache with retry logic
+// Get projects from database cache with support for chunked data
 async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
     const maxRetries = 3;
     let retryCount = 0;
@@ -232,6 +420,36 @@ async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
             }
             
             const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+            
+            // First check if we have a reference to chunked data
+            const chunkReferences = room.collection('profile_cache_references')
+                .filter({ username: username, cache_key: cacheKey })
+                .getList();
+                
+            if (chunkReferences && chunkReferences.length > 0) {
+                // Sort by timestamp to get the most recent
+                const sortedRefs = [...chunkReferences].sort((a, b) => 
+                    new Date(b.timestamp) - new Date(a.timestamp)
+                );
+                
+                const latestRef = sortedRefs[0];
+                const cacheTimestamp = new Date(latestRef.timestamp).getTime();
+                
+                if (isCacheExpired(cacheTimestamp, CACHE_CONFIG.projectsDbExpiry)) {
+                    // Clean up expired cache
+                    try {
+                        await room.collection('profile_cache_references').delete(latestRef.id);
+                    } catch (deleteError) {
+                        console.warn('Failed to delete expired chunk reference:', deleteError);
+                    }
+                    return null;
+                }
+                
+                // Retrieve the chunked data
+                return await retrieveChunkedData('profile_cache', latestRef.chunk_group_id);
+            }
+            
+            // If no chunked data, check regular cache
             const cacheEntries = room.collection('profile_cache')
                 .filter({ username: username, cache_key: cacheKey })
                 .getList();
@@ -262,8 +480,10 @@ async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
             retryCount++;
             console.warn(`Failed to read from database cache (attempt ${retryCount}/${maxRetries}):`, error);
             
-            // If it's the ReadableStream error, try to reconnect
-            if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+            // If it's a socket error, try to reconnect
+            if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
+                                 error.message.includes('Message is too large') ||
+                                 error.message.includes('socket closed'))) {
                 handleWebsocketError(error);
             }
             
@@ -1055,7 +1275,7 @@ function setupEventListeners() {
     profileHeader.appendChild(clearCacheBtn);
 }
 
-// Clear all caches with improved error handling
+// Clear all caches with improved error handling for large messages
 async function clearAllCaches() {
     try {
         // Clear localStorage caches
@@ -1081,6 +1301,7 @@ async function clearAllCaches() {
         
         while (retryCount < maxRetries && !success) {
             try {
+                // Clear regular cache entries
                 const cacheEntries = room.collection('profile_cache')
                     .filter({ username: currentUser.username })
                     .getList();
@@ -1089,13 +1310,34 @@ async function clearAllCaches() {
                     await room.collection('profile_cache').delete(entry.id);
                 }
                 
+                // Clear chunked cache references
+                const chunkReferences = room.collection('profile_cache_references')
+                    .filter({ username: currentUser.username })
+                    .getList();
+                    
+                for (const ref of chunkReferences) {
+                    // Delete the reference
+                    await room.collection('profile_cache_references').delete(ref.id);
+                    
+                    // Get and delete all associated chunks
+                    const chunks = room.collection('profile_cache_chunks')
+                        .filter({ chunk_group_id: ref.chunk_group_id })
+                        .getList();
+                        
+                    for (const chunk of chunks) {
+                        await room.collection('profile_cache_chunks').delete(chunk.id);
+                    }
+                }
+                
                 success = true;
             } catch (error) {
                 retryCount++;
                 console.warn(`Failed to clear database caches (attempt ${retryCount}/${maxRetries}):`, error);
                 
-                // If it's the ReadableStream error, try to reconnect
-                if (error.message && error.message.includes('Cannot enqueue a chunk into a readable stream that is closed')) {
+                // If it's a socket error, try to reconnect
+                if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
+                                     error.message.includes('Message is too large') ||
+                                     error.message.includes('socket closed'))) {
                     handleWebsocketError(error);
                 }
                 
@@ -1127,17 +1369,34 @@ async function clearAllCaches() {
     }
 }
 
-// Show error message with more details
+// Show error message with improved detail for message size errors
 function showError(message) {
     console.error("ERROR:", message);
     
     const container = document.querySelector('.container');
+    const existingError = container.querySelector('.error-message');
+    if (existingError) {
+        existingError.remove(); // Remove existing error before showing new one
+    }
+    
     const errorElement = document.createElement('div');
     errorElement.className = 'error-message';
-    errorElement.textContent = message;
+    
+    // Add specific help text for "Message is too large" errors
+    if (message.includes('Message is too large') || message.includes('socket closed') || message.includes('Message size exceeded')) {
+        errorElement.innerHTML = `
+            <div>
+                <strong>Data size error:</strong> The system is handling a large amount of data. 
+                Using a chunking strategy to work around this limitation.
+            </div>
+        `;
+    } else {
+        errorElement.textContent = message;
+    }
     
     // Add retry button for connection errors
-    if (message.includes('connection') || message.includes('network') || message.includes('WebSocket')) {
+    if (message.includes('connection') || message.includes('network') || message.includes('WebSocket') || 
+        message.includes('Message is too large') || message.includes('socket closed')) {
         const retryButton = document.createElement('button');
         retryButton.textContent = 'Retry Connection';
         retryButton.className = 'retry-button';
