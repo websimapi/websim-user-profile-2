@@ -11,6 +11,15 @@ const WEBSOCKET_RETRY_DELAY = 2000; // 2 seconds
 // Maximum chunk size for WebsimSocket messages (slightly below server limit)
 const MAX_CHUNK_SIZE = 25000; // bytes
 
+// HTTP Fetch retry configuration
+const FETCH_CONFIG = {
+    maxRetries: 5,
+    initialDelay: 1000, // 1 second
+    maxDelay: 30000, // 30 seconds
+    backoffFactor: 1.5, // Exponential backoff factor
+    retryStatusCodes: [408, 429, 500, 502, 503, 504] // Status codes to retry
+};
+
 // Cache configuration
 const CACHE_CONFIG = {
     projectsLocalExpiry: 1000 * 60 * 15, // 15 minutes local cache
@@ -45,6 +54,89 @@ async function init() {
     } catch (error) {
         console.error("Initialization error:", error);
         showError("Failed to initialize the app: " + error.message);
+    }
+}
+
+// Fetch wrapper with retry logic for HTTP errors
+async function fetchWithRetry(url, options = {}, retryCount = 0) {
+    try {
+        // Add progress indicator to UI if this is a retry
+        if (retryCount > 0) {
+            updateFetchStatus(`Retry attempt ${retryCount}/${FETCH_CONFIG.maxRetries} for: ${url.split('?')[0]}`);
+        }
+        
+        const response = await fetch(url, options);
+        
+        // If we get a status code that warrants retry
+        if (!response.ok && FETCH_CONFIG.retryStatusCodes.includes(response.status)) {
+            if (retryCount < FETCH_CONFIG.maxRetries) {
+                // Calculate delay with exponential backoff and some jitter
+                const delay = Math.min(
+                    FETCH_CONFIG.initialDelay * Math.pow(FETCH_CONFIG.backoffFactor, retryCount) + 
+                    Math.random() * 1000, // Add randomness to prevent thundering herd
+                    FETCH_CONFIG.maxDelay
+                );
+                
+                console.warn(`Fetch failed with status ${response.status}. Retrying in ${delay}ms...`);
+                updateFetchStatus(`Server error (${response.status}). Retrying in ${Math.round(delay/1000)}s...`);
+                
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return fetchWithRetry(url, options, retryCount + 1);
+            } else {
+                // All retries failed
+                throw new Error(`Failed after ${FETCH_CONFIG.maxRetries} retries: ${response.status} ${response.statusText}`);
+            }
+        }
+        
+        if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}`);
+        }
+        
+        // Clear any fetch status indicators on success
+        clearFetchStatus();
+        return response;
+    } catch (error) {
+        // Network errors (not HTTP errors) should also be retried
+        if (error.name === 'TypeError' && error.message.includes('fetch')) {
+            if (retryCount < FETCH_CONFIG.maxRetries) {
+                const delay = Math.min(
+                    FETCH_CONFIG.initialDelay * Math.pow(FETCH_CONFIG.backoffFactor, retryCount),
+                    FETCH_CONFIG.maxDelay
+                );
+                
+                console.warn(`Network error: ${error.message}. Retrying in ${delay}ms...`);
+                updateFetchStatus(`Network error. Retrying in ${Math.round(delay/1000)}s...`);
+                
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return fetchWithRetry(url, options, retryCount + 1);
+            }
+        }
+        
+        // Either a non-retriable error or we've exhausted retries
+        clearFetchStatus();
+        throw error;
+    }
+}
+
+// Update fetch status in the UI
+function updateFetchStatus(message) {
+    // Check if status element exists, create if not
+    let statusElement = document.querySelector('.fetch-status');
+    if (!statusElement) {
+        statusElement = document.createElement('div');
+        statusElement.className = 'fetch-status';
+        document.querySelector('.container').prepend(statusElement);
+    }
+    
+    statusElement.textContent = message;
+    statusElement.style.display = 'block';
+}
+
+// Clear fetch status from UI
+function clearFetchStatus() {
+    const statusElement = document.querySelector('.fetch-status');
+    if (statusElement) {
+        statusElement.style.display = 'none';
     }
 }
 
@@ -511,12 +603,8 @@ async function getProjectsFromDbCache(username, postedFilter, searchQuery) {
 // Load user profile data
 async function loadUserProfile(username) {
     try {
-        // Get user details
-        const response = await fetch(`/api/v1/users/${username}`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch user data: ${response.status} ${response.statusText}`);
-        }
-        
+        // Get user details with retry
+        const response = await fetchWithRetry(`/api/v1/users/${username}`);
         const userData = await response.json();
         
         if (!userData.user) {
@@ -545,14 +633,10 @@ async function loadUserProfile(username) {
     }
 }
 
-// Load user statistics
+// Load user statistics with retry
 async function loadUserStats(username) {
     try {
-        const response = await fetch(`/api/v1/users/${username}/stats`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch user stats: ${response.status} ${response.statusText}`);
-        }
-        
+        const response = await fetchWithRetry(`/api/v1/users/${username}/stats`);
         const statsData = await response.json();
         
         if (statsData.stats) {
@@ -565,14 +649,10 @@ async function loadUserStats(username) {
     }
 }
 
-// Load followers count
+// Load followers count with retry
 async function loadFollowerCount(username) {
     try {
-        const response = await fetch(`/api/v1/users/${username}/followers?count=true`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch followers count: ${response.status} ${response.statusText}`);
-        }
-        
+        const response = await fetchWithRetry(`/api/v1/users/${username}/followers?count=true`);
         const followersData = await response.json();
         
         if (followersData.followers && followersData.followers.meta) {
@@ -584,14 +664,10 @@ async function loadFollowerCount(username) {
     }
 }
 
-// Load following count
+// Load following count with retry
 async function loadFollowingCount(username) {
     try {
-        const response = await fetch(`/api/v1/users/${username}/following?count=true`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch following count: ${response.status} ${response.statusText}`);
-        }
-        
+        const response = await fetchWithRetry(`/api/v1/users/${username}/following?count=true`);
         const followingData = await response.json();
         
         if (followingData.following && followingData.following.meta) {
@@ -614,7 +690,7 @@ function formatNumber(num) {
     return num;
 }
 
-// Load projects with improved cache validation and support for unposted projects
+// Load projects with improved error handling and retry logic
 async function loadProjects() {
     const projectsContainer = document.getElementById('projects-container');
     projectsContainer.innerHTML = '<div class="loading">Loading projects...</div>';
@@ -657,11 +733,8 @@ async function loadProjects() {
         console.log(`Fetching initial batch to validate cache (postedFilter: ${postedFilter})`);
         progressElement.textContent = 'Validating cache...';
         
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch projects: ${response.status} ${response.statusText}`);
-        }
-        
+        // Use fetchWithRetry instead of fetch
+        const response = await fetchWithRetry(url);
         const data = await response.json();
         
         if (!data.projects || !data.projects.data) {
@@ -738,7 +811,7 @@ async function loadProjects() {
         progressElement.textContent = `Loading projects (${userProjects.length})...`;
         progressElement.classList.add('from-api');
         
-        // Fetch remaining pages
+        // Fetch remaining pages with retry logic
         while (hasNextPage && afterCursor) {
             let pageUrl = `/api/v1/users/${currentUser.username}/projects?first=50`;
             
@@ -755,11 +828,8 @@ async function loadProjects() {
                 pageUrl += `&query=${encodeURIComponent(searchQuery)}`;
             }
             
-            const pageResponse = await fetch(pageUrl);
-            if (!pageResponse.ok) {
-                throw new Error(`Failed to fetch projects page: ${pageResponse.status} ${pageResponse.statusText}`);
-            }
-            
+            // Use fetchWithRetry instead of fetch
+            const pageResponse = await fetchWithRetry(pageUrl);
             const pageData = await pageResponse.json();
             
             if (!pageData.projects || !pageData.projects.data) {
@@ -787,7 +857,12 @@ async function loadProjects() {
         
     } catch (error) {
         console.error("Error loading projects:", error);
-        projectsContainer.innerHTML = `<div class="error-message">Failed to load projects: ${error.message}</div>`;
+        projectsContainer.innerHTML = `
+            <div class="error-message">
+                <div>Failed to load projects: ${error.message}</div>
+                <button class="retry-button" onclick="loadProjects()">Retry Loading Projects</button>
+            </div>
+        `;
     }
 }
 
@@ -857,7 +932,7 @@ function renderProjects() {
     }
 }
 
-// Load followers with improved cache validation
+// Load followers with improved error handling and retry logic
 async function loadFollowers() {
     const followersContainer = document.getElementById('followers-container');
     followersContainer.innerHTML = '<div class="loading">Loading followers...</div>';
@@ -886,7 +961,8 @@ async function loadFollowers() {
         console.log("Fetching initial followers batch to validate cache");
         progressElement.textContent = 'Validating cache...';
         
-        const response = await fetch(url);
+        // Use fetchWithRetry instead of fetch
+        const response = await fetchWithRetry(url);
         const data = await response.json();
         
         if (!data.followers || !data.followers.data) {
@@ -946,7 +1022,7 @@ async function loadFollowers() {
                 pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
             }
             
-            const pageResponse = await fetch(pageUrl);
+            const pageResponse = await fetchWithRetry(pageUrl);
             const pageData = await pageResponse.json();
             
             if (!pageData.followers || !pageData.followers.data) {
@@ -973,7 +1049,12 @@ async function loadFollowers() {
         
     } catch (error) {
         console.error("Error loading followers:", error);
-        followersContainer.innerHTML = '<div class="error">Failed to load followers</div>';
+        followersContainer.innerHTML = `
+            <div class="error-message">
+                <div>Failed to load followers: ${error.message}</div>
+                <button class="retry-button" onclick="loadFollowers()">Retry Loading Followers</button>
+            </div>
+        `;
     }
 }
 
@@ -1007,7 +1088,7 @@ function renderFollowers() {
     followersContainer.innerHTML = followersHTML;
 }
 
-// Load following with improved cache validation
+// Load following with improved error handling and retry logic
 async function loadFollowing() {
     const followingContainer = document.getElementById('following-container');
     followingContainer.innerHTML = '<div class="loading">Loading following...</div>';
@@ -1036,7 +1117,8 @@ async function loadFollowing() {
         console.log("Fetching initial following batch to validate cache");
         progressElement.textContent = 'Validating cache...';
         
-        const response = await fetch(url);
+        // Use fetchWithRetry instead of fetch
+        const response = await fetchWithRetry(url);
         const data = await response.json();
         
         if (!data.following || !data.following.data) {
@@ -1096,7 +1178,7 @@ async function loadFollowing() {
                 pageUrl += `&after=${encodeURIComponent(afterCursor)}`;
             }
             
-            const pageResponse = await fetch(pageUrl);
+            const pageResponse = await fetchWithRetry(pageUrl);
             const pageData = await pageResponse.json();
             
             if (!pageData.following || !pageData.following.data) {
@@ -1123,7 +1205,12 @@ async function loadFollowing() {
         
     } catch (error) {
         console.error("Error loading following:", error);
-        followingContainer.innerHTML = '<div class="error">Failed to load following</div>';
+        followingContainer.innerHTML = `
+            <div class="error-message">
+                <div>Failed to load following: ${error.message}</div>
+                <button class="retry-button" onclick="loadFollowing()">Retry Loading Following</button>
+            </div>
+        `;
     }
 }
 
@@ -1410,7 +1497,7 @@ async function clearAllCaches() {
     }
 }
 
-// Show error message with improved detail for message size errors
+// Show error message with improved detail and retry options
 function showError(message) {
     console.error("ERROR:", message);
     
@@ -1423,7 +1510,7 @@ function showError(message) {
     const errorElement = document.createElement('div');
     errorElement.className = 'error-message';
     
-    // Add specific help text for "Message is too large" errors
+    // Add specific help text for different error types
     if (message.includes('Message is too large') || message.includes('socket closed') || message.includes('Message size exceeded')) {
         errorElement.innerHTML = `
             <div>
@@ -1431,21 +1518,55 @@ function showError(message) {
                 Using a chunking strategy to work around this limitation.
             </div>
         `;
+    } else if (message.includes('500')) {
+        errorElement.innerHTML = `
+            <div>
+                <strong>Server error (500):</strong> The server encountered an internal error.
+                This is often temporary. We'll automatically retry the request.
+            </div>
+        `;
+    } else if (message.includes('502') || message.includes('503') || message.includes('504')) {
+        errorElement.innerHTML = `
+            <div>
+                <strong>Server unavailable:</strong> The server is temporarily unavailable.
+                This is often due to maintenance or high load. We'll automatically retry.
+            </div>
+        `;
+    } else if (message.includes('429')) {
+        errorElement.innerHTML = `
+            <div>
+                <strong>Too many requests:</strong> We've sent too many requests to the server.
+                Taking a brief pause before retrying.
+            </div>
+        `;
+    } else if (message.includes('fetch') || message.includes('network')) {
+        errorElement.innerHTML = `
+            <div>
+                <strong>Network error:</strong> There was a problem connecting to the server.
+                Please check your internet connection. We'll automatically retry.
+            </div>
+        `;
     } else {
         errorElement.textContent = message;
     }
     
-    // Add retry button for connection errors
+    // Add retry button for connection errors and server errors
     if (message.includes('connection') || message.includes('network') || message.includes('WebSocket') || 
-        message.includes('Message is too large') || message.includes('socket closed')) {
+        message.includes('Message is too large') || message.includes('socket closed') ||
+        message.includes('500') || message.includes('502') || message.includes('503') || 
+        message.includes('504') || message.includes('429')) {
+        
         const retryButton = document.createElement('button');
         retryButton.textContent = 'Retry Connection';
         retryButton.className = 'retry-button';
         retryButton.addEventListener('click', async () => {
             errorElement.textContent = 'Reconnecting...';
             try {
-                await initializeWebsimSocket();
-                errorElement.remove();
+                // If it's a WebSocket issue
+                if (message.includes('WebSocket') || message.includes('socket closed')) {
+                    await initializeWebsimSocket();
+                }
+                
                 // Reload current tab
                 const activeTab = document.querySelector('.tab-btn.active').getAttribute('data-tab');
                 if (activeTab === 'projects') {
@@ -1457,6 +1578,8 @@ function showError(message) {
                 } else if (activeTab === 'analytics') {
                     loadAnalytics();
                 }
+                
+                errorElement.remove();
             } catch (error) {
                 errorElement.textContent = 'Reconnection failed: ' + error.message;
             }
@@ -1466,9 +1589,12 @@ function showError(message) {
     
     container.prepend(errorElement);
     
-    setTimeout(() => {
-        errorElement.remove();
-    }, 10000); // Show error for 10 seconds
+    // Remove error after a while (except for critical errors)
+    if (!message.includes('Failed to initialize')) {
+        setTimeout(() => {
+            errorElement.remove();
+        }, 10000); // Show error for 10 seconds
+    }
 }
 
 // Initialize the app when page loads

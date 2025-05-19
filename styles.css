@@ -400,6 +400,37 @@ canvas {
 }
 
 /* Improve error message styling */
+.fetch-status {
+    background-color: #fff3cd;
+    color: #856404;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    border-left: 4px solid #ffc107;
+    box-shadow: 0 2px 8px rgba(133, 100, 4, 0.1);
+    animation: fadeIn 0.3s ease-in-out;
+    font-weight: 500;
+    position: relative;
+}
+
+.fetch-status::before {
+    content: '';
+    width: 20px;
+    height: 20px;
+    margin-right: 10px;
+    border: 2px solid #ffc107;
+    border-radius: 50%;
+    border-top-color: transparent;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
 .error-message {
     background-color: #ffebee;
     color: #b71c1c;
@@ -411,11 +442,44 @@ canvas {
     justify-content: space-between;
     box-shadow: 0 2px 8px rgba(183, 28, 28, 0.2);
     animation: fadeIn 0.3s ease-in-out;
+    border-left: 4px solid #b71c1c;
 }
 
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateY(-10px); }
-    to { opacity: 1; transform: translateY(0); }
+.retry-button {
+    background-color: #b71c1c;
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.2s ease;
+    margin-left: 1rem;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+.retry-button:hover {
+    background-color: #d32f2f;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    transform: translateY(-2px);
+}
+
+.reconnecting-indicator {
+    display: inline-block;
+    padding: 0.25rem 0.5rem;
+    background-color: #ffe0b2;
+    color: #e65100;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    margin-left: 1rem;
+    font-weight: 500;
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { opacity: 0.6; }
+    50% { opacity: 1; }
+    100% { opacity: 0.6; }
 }
 
 .no-results {
@@ -471,41 +535,6 @@ canvas {
 .cache-indicator.from-api {
     background-color: #ffebee;
     color: #b71c1c;
-}
-
-/* Add styles for error messages and retry button */
-.retry-button {
-    background-color: #b71c1c;
-    color: white;
-    border: none;
-    padding: 0.5rem 1rem;
-    border-radius: 4px;
-    cursor: pointer;
-    font-weight: 500;
-    transition: background-color 0.2s ease;
-    margin-left: 1rem;
-}
-
-.retry-button:hover {
-    background-color: #d32f2f;
-}
-
-.reconnecting-indicator {
-    display: inline-block;
-    padding: 0.25rem 0.5rem;
-    background-color: #ffe0b2;
-    color: #e65100;
-    border-radius: 4px;
-    font-size: 0.75rem;
-    margin-left: 1rem;
-    font-weight: 500;
-    animation: pulse 1.5s infinite;
-}
-
-@keyframes pulse {
-    0% { opacity: 0.6; }
-    50% { opacity: 1; }
-    100% { opacity: 0.6; }
 }
 
 /* Responsive Adjustments */
