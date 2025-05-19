@@ -4,7 +4,15 @@ let userProjects = [];
 let userFollowers = [];
 let userFollowing = [];
 let isLoadingMore = false;
-let projectsCache = {}; // Cache for projects to improve performance
+let room = new WebsimSocket(); // Initialize WebsimSocket for database access
+
+// Cache configuration
+const CACHE_CONFIG = {
+    projectsLocalExpiry: 1000 * 60 * 15, // 15 minutes local cache
+    projectsDbExpiry: 1000 * 60 * 60 * 24, // 24 hours DB cache
+    followersExpiry: 1000 * 60 * 30, // 30 minutes
+    followingExpiry: 1000 * 60 * 30, // 30 minutes
+};
 
 // Initialize the app
 async function init() {
@@ -32,11 +40,100 @@ async function init() {
     }
 }
 
+// Cache Management Functions
+// -------------------------
+
+// Check if a cache entry is expired
+function isCacheExpired(timestamp, expiryTime) {
+    return !timestamp || Date.now() - timestamp > expiryTime;
+}
+
+// Save data to localStorage with timestamp
+function saveToLocalCache(key, data) {
+    try {
+        localStorage.setItem(key, JSON.stringify({
+            timestamp: Date.now(),
+            data: data
+        }));
+        return true;
+    } catch (error) {
+        console.warn('Failed to save to localStorage:', error);
+        return false;
+    }
+}
+
+// Get data from localStorage if not expired
+function getFromLocalCache(key, expiryTime) {
+    try {
+        const cached = localStorage.getItem(key);
+        if (!cached) return null;
+        
+        const parsedCache = JSON.parse(cached);
+        if (isCacheExpired(parsedCache.timestamp, expiryTime)) {
+            localStorage.removeItem(key); // Clean up expired cache
+            return null;
+        }
+        
+        return parsedCache.data;
+    } catch (error) {
+        console.warn('Failed to read from localStorage:', error);
+        return null;
+    }
+}
+
+// Save projects data to database cache
+async function saveProjectsToDbCache(username, projects, postedOnly, searchQuery) {
+    try {
+        const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+        await room.collection('profile_cache').create({
+            username: username,
+            cache_key: cacheKey,
+            data: projects,
+            timestamp: new Date().toISOString()
+        });
+        return true;
+    } catch (error) {
+        console.warn('Failed to save to database cache:', error);
+        return false;
+    }
+}
+
+// Get projects from database cache if not expired
+async function getProjectsFromDbCache(username, postedOnly, searchQuery) {
+    try {
+        const cacheKey = `projects_${postedOnly}_${searchQuery || 'all'}`;
+        const cacheEntries = room.collection('profile_cache')
+            .filter({ username: username, cache_key: cacheKey })
+            .getList();
+            
+        if (!cacheEntries || cacheEntries.length === 0) return null;
+        
+        // Sort by timestamp to get the most recent cache entry
+        const sortedEntries = [...cacheEntries].sort((a, b) => 
+            new Date(b.timestamp) - new Date(a.timestamp)
+        );
+        
+        const latestCache = sortedEntries[0];
+        const cacheTimestamp = new Date(latestCache.timestamp).getTime();
+        
+        if (isCacheExpired(cacheTimestamp, CACHE_CONFIG.projectsDbExpiry)) {
+            // Clean up expired cache
+            await room.collection('profile_cache').delete(latestCache.id);
+            return null;
+        }
+        
+        return latestCache.data;
+    } catch (error) {
+        console.warn('Failed to read from database cache:', error);
+        return null;
+    }
+}
+
 // Load user profile data
 async function loadUserProfile(username) {
     try {
         // Get user details
-        const response = await fetchWithRetry(`/api/v1/users/${username}`, {}, 3);
+        const response = await fetch(`/api/v1/users/${username}`);
         const userData = await response.json();
         
         if (!userData.user) {
@@ -54,12 +151,12 @@ async function loadUserProfile(username) {
             document.getElementById('avatar').src = `https://images.websim.com/avatar/${userData.user.username}`;
         }
         
-        // Load user stats and followers/following counts in parallel
-        await Promise.all([
-            loadUserStats(username),
-            loadFollowerCount(username),
-            loadFollowingCount(username)
-        ]);
+        // Load user stats
+        await loadUserStats(username);
+        
+        // Load followers and following counts
+        await loadFollowerCount(username);
+        await loadFollowingCount(username);
     } catch (error) {
         console.error("Error loading user profile:", error);
         showError("Failed to load user profile");
@@ -69,7 +166,7 @@ async function loadUserProfile(username) {
 // Load user statistics
 async function loadUserStats(username) {
     try {
-        const response = await fetchWithRetry(`/api/v1/users/${username}/stats`, {}, 3);
+        const response = await fetch(`/api/v1/users/${username}/stats`);
         const statsData = await response.json();
         
         if (statsData.stats) {
@@ -78,14 +175,13 @@ async function loadUserStats(username) {
         }
     } catch (error) {
         console.error("Error loading user stats:", error);
-        showError("Failed to load user statistics");
     }
 }
 
 // Load followers count
 async function loadFollowerCount(username) {
     try {
-        const response = await fetchWithRetry(`/api/v1/users/${username}/followers?count=true`, {}, 3);
+        const response = await fetch(`/api/v1/users/${username}/followers?count=true`);
         const followersData = await response.json();
         
         if (followersData.followers && followersData.followers.meta) {
@@ -99,7 +195,7 @@ async function loadFollowerCount(username) {
 // Load following count
 async function loadFollowingCount(username) {
     try {
-        const response = await fetchWithRetry(`/api/v1/users/${username}/following?count=true`, {}, 3);
+        const response = await fetch(`/api/v1/users/${username}/following?count=true`);
         const followingData = await response.json();
         
         if (followingData.following && followingData.following.meta) {
@@ -121,7 +217,7 @@ function formatNumber(num) {
     return num;
 }
 
-// Load projects with progressive rendering
+// Load projects with cache support
 async function loadProjects() {
     const projectsContainer = document.getElementById('projects-container');
     projectsContainer.innerHTML = '<div class="loading">Loading projects...</div>';
@@ -130,164 +226,65 @@ async function loadProjects() {
         const postedOnly = document.getElementById('posted-only').checked;
         const searchQuery = document.getElementById('search-input').value.trim();
         
-        // Generate cache key based on filters
-        const cacheKey = `${currentUser.username}-${postedOnly}-${searchQuery}`;
-        
         // Reset projects array
         userProjects = [];
         
-        // Create progress container
-        const progressContainer = document.createElement('div');
-        progressContainer.className = 'loading-container';
-        progressContainer.innerHTML = `
-            <div class="loading-progress">Loading projects (0)...</div>
-            <div class="loading-bar"><div class="loading-bar-fill"></div></div>
-        `;
-        projectsContainer.innerHTML = '';
-        projectsContainer.appendChild(progressContainer);
+        // Create cache keys
+        const localCacheKey = `projects_${currentUser.username}_${postedOnly}_${searchQuery || 'all'}`;
         
-        // Start progressive loading
-        await progressiveLoadProjects(cacheKey, postedOnly, searchQuery, progressContainer, projectsContainer);
+        // Try to load from localStorage first (fastest)
+        const localCachedProjects = getFromLocalCache(localCacheKey, CACHE_CONFIG.projectsLocalExpiry);
         
-        // Update project count
-        document.getElementById('projects-count').textContent = userProjects.length;
-        
-        // If analytics tab is active, update the analytics data
-        if (document.getElementById('analytics').classList.contains('active')) {
-            loadAnalytics();
+        if (localCachedProjects) {
+            console.log("Loading projects from localStorage cache");
+            userProjects = localCachedProjects;
+            renderProjects();
+            return;
         }
+        
+        // If not in localStorage, try database cache
+        const dbCachedProjects = await getProjectsFromDbCache(currentUser.username, postedOnly, searchQuery);
+        
+        if (dbCachedProjects) {
+            console.log("Loading projects from database cache");
+            userProjects = dbCachedProjects;
+            
+            // Also update localStorage for faster access next time
+            saveToLocalCache(localCacheKey, dbCachedProjects);
+            
+            renderProjects();
+            return;
+        }
+        
+        // If not cached, fetch from API
+        console.log("Fetching projects from API");
+        await fetchAllProjects(postedOnly, searchQuery);
+        
+        // Cache the results for future use
+        saveToLocalCache(localCacheKey, userProjects);
+        saveProjectsToDbCache(currentUser.username, userProjects, postedOnly, searchQuery);
+        
+        renderProjects();
     } catch (error) {
         console.error("Error loading projects:", error);
-        projectsContainer.innerHTML = `
-            <div class="error">
-                Failed to load projects
-                <button class="retry-btn" onclick="loadProjects()">Retry</button>
-            </div>
-        `;
+        projectsContainer.innerHTML = '<div class="error">Failed to load projects</div>';
     }
 }
 
-// Progressive loading of projects with rendered batches
-async function progressiveLoadProjects(cacheKey, postedOnly, searchQuery, progressContainer, projectsContainer) {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const initialBatchSize = 20; // Smaller initial batch for faster first render
-    const subsequentBatchSize = 50; // Larger batches after initial render
-    let batchSize = initialBatchSize;
-    let totalLoaded = 0;
-    let renderQueue = [];
+// Render projects to the UI
+function renderProjects() {
+    const projectsContainer = document.getElementById('projects-container');
     
-    // Check if we have cached results
-    if (projectsCache[cacheKey]) {
-        console.log('Using cached projects');
-        userProjects = [...projectsCache[cacheKey]];
-        renderAllProjects(projectsContainer);
+    document.getElementById('projects-count').textContent = userProjects.length;
+    
+    if (userProjects.length === 0) {
+        projectsContainer.innerHTML = '<div class="no-results">No projects found</div>';
         return;
     }
     
-    // Create project grid container
-    const gridContainer = document.createElement('div');
-    gridContainer.className = 'projects-container';
+    let projectsHTML = '';
     
-    // Add a container for projects to progressively render into
-    projectsContainer.appendChild(gridContainer);
-    
-    const progressElement = progressContainer.querySelector('.loading-progress');
-    const progressBarFill = progressContainer.querySelector('.loading-bar-fill');
-    
-    let retryCount = 0;
-    const maxRetries = 3;
-    
-    while (hasNextPage) {
-        try {
-            let url = `/api/v1/users/${currentUser.username}/projects?first=${batchSize}`;
-            
-            if (afterCursor) {
-                url += `&after=${encodeURIComponent(afterCursor)}`;
-            }
-            
-            if (postedOnly) {
-                url += '&posted=true';
-            }
-            
-            if (searchQuery) {
-                url += `&query=${encodeURIComponent(searchQuery)}`;
-            }
-            
-            const response = await fetchWithRetry(url, {}, 3);
-            const data = await response.json();
-            
-            if (!data.projects || !data.projects.data) {
-                break;
-            }
-            
-            const newProjects = data.projects.data;
-            
-            // Add new projects to our array
-            userProjects = [...userProjects, ...newProjects];
-            
-            // Add to render queue
-            renderQueue = [...renderQueue, ...newProjects];
-            
-            // If we have enough projects in queue or this is the last batch, render them
-            if (renderQueue.length >= 10 || !data.projects.meta.has_next_page) {
-                renderProjectBatch(gridContainer, renderQueue);
-                renderQueue = [];
-            }
-            
-            totalLoaded += newProjects.length;
-            
-            // Update progress indicator
-            progressElement.textContent = `Loading projects (${totalLoaded})...`;
-            progressBarFill.style.width = `${Math.min(totalLoaded / Math.max(totalLoaded + 50, 100) * 100, 100)}%`;
-            
-            // Check if there are more pages
-            hasNextPage = data.projects.meta.has_next_page;
-            afterCursor = data.projects.meta.end_cursor;
-            
-            // Switch to larger batch size after first render
-            batchSize = subsequentBatchSize;
-            
-            // Reset retry count after successful request
-            retryCount = 0;
-            
-            // If no more pages or no cursor, break the loop
-            if (!hasNextPage || !afterCursor) {
-                break;
-            }
-        } catch (error) {
-            retryCount++;
-            console.error(`Error loading projects batch (attempt ${retryCount}):`, error);
-            
-            if (retryCount >= maxRetries) {
-                showError(`Failed to load all projects. Loaded ${totalLoaded} projects so far.`);
-                break;
-            }
-            
-            // Brief pause before retry
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-    }
-    
-    // Cache the results for future use
-    projectsCache[cacheKey] = [...userProjects];
-    
-    // Remove progress indicator
-    progressContainer.remove();
-    
-    // Show no results message if needed
-    if (userProjects.length === 0) {
-        gridContainer.innerHTML = '<div class="no-results">No projects found</div>';
-    }
-}
-
-// Render a batch of projects to the grid
-function renderProjectBatch(container, projects) {
-    if (projects.length === 0) return;
-    
-    const fragment = document.createDocumentFragment();
-    
-    projects.forEach(projectData => {
+    userProjects.forEach(projectData => {
         const project = projectData.project;
         const site = projectData.site;
         const stats = project.stats;
@@ -296,91 +293,103 @@ function renderProjectBatch(container, projects) {
             `https://images.websim.com/v1/site/${site.id}/600` : 
             'https://via.placeholder.com/300x180?text=No+Thumbnail';
         
-        const projectCard = document.createElement('div');
-        projectCard.className = 'project-card';
-        projectCard.innerHTML = `
-            <img src="${thumbnailUrl}" alt="${project.title || 'Untitled Project'}" class="project-thumbnail" loading="lazy">
-            <div class="project-details">
-                <h3 class="project-title">${project.title || 'Untitled Project'}</h3>
-                <p class="project-description">${project.description || 'No description provided'}</p>
-                <div class="project-stats">
-                    <span>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="currentColor" stroke-width="2"/>
-                            <path d="M2.45825 12C3.73253 7.94288 7.52281 5 12.0004 5C16.4781 5 20.2684 7.94291 21.5426 12C20.2684 16.0571 16.4781 19 12.0005 19C7.52281 19 3.73251 16.0571 2.45825 12Z" stroke="currentColor" stroke-width="2"/>
-                        </svg>
-                        ${formatNumber(stats.views)}
-                    </span>
-                    <span>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M12 5.50063C7.50016 0.825464 2 4.27416 2 9.1371C2 14 6.01943 16.5914 8.96173 18.9109C10 19.7294 11 20.5 12 20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                            <path d="M12 5.50063C16.4998 0.825464 22 4.27416 22 9.1371C22 14 17.9806 16.5914 15.0383 18.9109C14 19.7294 13 20.5 12 20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                        </svg>
-                        ${formatNumber(stats.likes)}
-                    </span>
-                    <span>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                            <path d="M12 21C16.9706 21 21 16.9706 21 12C21 7.02944 16.9706 3 12 3C7.02944 3 3 7.02944 3 12C3 13.4876 3.36093 14.891 4 16.1272L3 21L7.8728 20C9.10904 20.6391 10.5124 21 12 21Z" stroke="currentColor" stroke-width="2"/>
-                        </svg>
-                        ${formatNumber(stats.comments)}
-                    </span>
-                    <a href="${site ? `https://websim.com/c/${site.id}` : `https://websim.com/p/${project.id}`}" target="_blank" class="view-link">
-                        View
-                    </a>
+        projectsHTML += `
+            <div class="project-card">
+                <img src="${thumbnailUrl}" alt="${project.title || 'Untitled Project'}" class="project-thumbnail">
+                <div class="project-details">
+                    <h3 class="project-title">${project.title || 'Untitled Project'}</h3>
+                    <p class="project-description">${project.description || 'No description provided'}</p>
+                    <div class="project-stats">
+                        <span>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M15 12C15 13.6569 13.6569 15 12 15C10.3431 15 9 13.6569 9 12C9 10.3431 10.3431 9 12 9C13.6569 9 15 10.3431 15 12Z" stroke="currentColor" stroke-width="2"/>
+                                <path d="M2.45825 12C3.73253 7.94288 7.52281 5 12.0004 5C16.4781 5 20.2684 7.94291 21.5426 12C20.2684 16.0571 16.4781 19 12.0005 19C7.52281 19 3.73251 16.0571 2.45825 12Z" stroke="currentColor" stroke-width="2"/>
+                            </svg>
+                            ${formatNumber(stats.views)}
+                        </span>
+                        <span>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M12 5.50063C7.50016 0.825464 2 4.27416 2 9.1371C2 14 6.01943 16.5914 8.96173 18.9109C10 19.7294 11 20.5 12 20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                                <path d="M12 5.50063C16.4998 0.825464 22 4.27416 22 9.1371C22 14 17.9806 16.5914 15.0383 18.9109C14 19.7294 13 20.5 12 20.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            </svg>
+                            ${formatNumber(stats.likes)}
+                        </span>
+                        <span>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M12 21C16.9706 21 21 16.9706 21 12C21 7.02944 16.9706 3 12 3C7.02944 3 3 7.02944 3 12C3 13.4876 3.36093 14.891 4 16.1272L3 21L7.8728 20C9.10904 20.6391 10.5124 21 12 21Z" stroke="currentColor" stroke-width="2"/>
+                            </svg>
+                            ${formatNumber(stats.comments)}
+                        </span>
+                        <a href="${site ? `https://websim.com/c/${site.id}` : `https://websim.com/p/${project.id}`}" target="_blank" class="view-link">
+                            View
+                        </a>
+                    </div>
                 </div>
             </div>
         `;
-        
-        fragment.appendChild(projectCard);
     });
     
-    container.appendChild(fragment);
-}
-
-// Render all projects at once (used when loading from cache)
-function renderAllProjects(container) {
-    const gridContainer = document.createElement('div');
-    gridContainer.className = 'projects-container';
-    container.innerHTML = '';
-    container.appendChild(gridContainer);
+    projectsContainer.innerHTML = projectsHTML;
     
-    if (userProjects.length === 0) {
-        gridContainer.innerHTML = '<div class="no-results">No projects found</div>';
-        return;
+    // If analytics tab is active, update the analytics data
+    if (document.getElementById('analytics').classList.contains('active')) {
+        loadAnalytics();
     }
-    
-    renderProjectBatch(gridContainer, userProjects);
 }
 
-// Fetch with retry mechanism
-async function fetchWithRetry(url, options = {}, maxRetries = 3, delay = 1000) {
-    let retries = 0;
+// Fetch all projects using pagination
+async function fetchAllProjects(postedOnly, searchQuery) {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50 for efficiency
     
-    while (retries < maxRetries) {
-        try {
-            const response = await fetch(url, options);
-            
-            if (!response.ok) {
-                throw new Error(`HTTP error ${response.status}`);
-            }
-            
-            return response;
-        } catch (error) {
-            retries++;
-            console.warn(`Fetch attempt ${retries} failed: ${error.message}`);
-            
-            if (retries >= maxRetries) {
-                throw new Error(`Failed after ${maxRetries} attempts: ${error.message}`);
-            }
-            
-            // Exponential backoff delay
-            const backoffDelay = delay * Math.pow(2, retries - 1);
-            await new Promise(resolve => setTimeout(resolve, backoffDelay));
+    const projectsContainer = document.getElementById('projects-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading projects (0)...';
+    projectsContainer.innerHTML = '';
+    projectsContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/projects?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        if (postedOnly) {
+            url += '&posted=true';
+        }
+        
+        if (searchQuery) {
+            url += `&query=${encodeURIComponent(searchQuery)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.projects || !data.projects.data) {
+            break;
+        }
+        
+        // Add new projects to our array
+        userProjects = [...userProjects, ...data.projects.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading projects (${userProjects.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.projects.meta.has_next_page;
+        afterCursor = data.projects.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
         }
     }
 }
 
-// Load followers
+// Load followers with cache support
 async function loadFollowers() {
     const followersContainer = document.getElementById('followers-container');
     followersContainer.innerHTML = '<div class="loading">Loading followers...</div>';
@@ -389,132 +398,108 @@ async function loadFollowers() {
         // Reset followers array
         userFollowers = [];
         
-        // Create progress container
-        const progressContainer = document.createElement('div');
-        progressContainer.className = 'loading-container';
-        progressContainer.innerHTML = `
-            <div class="loading-progress">Loading followers (0)...</div>
-            <div class="loading-bar"><div class="loading-bar-fill"></div></div>
-        `;
-        followersContainer.innerHTML = '';
-        followersContainer.appendChild(progressContainer);
+        // Create cache key
+        const cacheKey = `followers_${currentUser.username}`;
         
-        // Fetch all followers using pagination
-        await fetchAllFollowers(progressContainer, followersContainer);
+        // Try to load from localStorage
+        const cachedFollowers = getFromLocalCache(cacheKey, CACHE_CONFIG.followersExpiry);
         
-        // Update UI based on result
-        if (userFollowers.length === 0) {
-            followersContainer.innerHTML = '<div class="no-results">No followers found</div>';
+        if (cachedFollowers) {
+            console.log("Loading followers from cache");
+            userFollowers = cachedFollowers;
+            renderFollowers();
+            return;
         }
+        
+        // If not cached, fetch from API
+        console.log("Fetching followers from API");
+        await fetchAllFollowers();
+        
+        // Cache the results
+        saveToLocalCache(cacheKey, userFollowers);
+        
+        renderFollowers();
     } catch (error) {
         console.error("Error loading followers:", error);
-        followersContainer.innerHTML = `
-            <div class="error">
-                Failed to load followers
-                <button class="retry-btn" onclick="loadFollowers()">Retry</button>
-            </div>
-        `;
+        followersContainer.innerHTML = '<div class="error">Failed to load followers</div>';
     }
 }
 
-// Fetch all followers using pagination with progressive rendering
-async function fetchAllFollowers(progressContainer, followersContainer) {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const batchSize = 30; // Reasonable batch size
-    let totalLoaded = 0;
-    let renderQueue = [];
+// Render followers to the UI
+function renderFollowers() {
+    const followersContainer = document.getElementById('followers-container');
     
-    // Create followers grid container
-    const gridContainer = document.createElement('div');
-    gridContainer.className = 'users-container';
-    followersContainer.appendChild(gridContainer);
-    
-    const progressElement = progressContainer.querySelector('.loading-progress');
-    const progressBarFill = progressContainer.querySelector('.loading-bar-fill');
-    
-    while (hasNextPage) {
-        try {
-            let url = `/api/v1/users/${currentUser.username}/followers?first=${batchSize}`;
-            
-            if (afterCursor) {
-                url += `&after=${encodeURIComponent(afterCursor)}`;
-            }
-            
-            const response = await fetchWithRetry(url, {}, 3);
-            const data = await response.json();
-            
-            if (!data.followers || !data.followers.data) {
-                break;
-            }
-            
-            const newFollowers = data.followers.data;
-            
-            // Add new followers to our array
-            userFollowers = [...userFollowers, ...newFollowers];
-            
-            // Add to render queue
-            renderQueue = [...renderQueue, ...newFollowers];
-            
-            // If we have enough followers in queue or this is the last batch, render them
-            if (renderQueue.length >= 10 || !data.followers.meta.has_next_page) {
-                renderFollowersBatch(gridContainer, renderQueue);
-                renderQueue = [];
-            }
-            
-            totalLoaded += newFollowers.length;
-            
-            // Update progress indicator
-            progressElement.textContent = `Loading followers (${totalLoaded})...`;
-            progressBarFill.style.width = `${Math.min(totalLoaded / Math.max(totalLoaded + 30, 50) * 100, 100)}%`;
-            
-            // Check if there are more pages
-            hasNextPage = data.followers.meta.has_next_page;
-            afterCursor = data.followers.meta.end_cursor;
-            
-            // If no more pages or no cursor, break the loop
-            if (!hasNextPage || !afterCursor) {
-                break;
-            }
-        } catch (error) {
-            console.error("Error fetching followers batch:", error);
-            showError("Failed to load all followers. Please try again.");
-            break;
-        }
+    if (userFollowers.length === 0) {
+        followersContainer.innerHTML = '<div class="no-results">No followers found</div>';
+        return;
     }
     
-    // Remove progress indicator
-    progressContainer.remove();
-}
-
-// Render a batch of followers
-function renderFollowersBatch(container, followers) {
-    if (followers.length === 0) return;
+    let followersHTML = '';
     
-    const fragment = document.createDocumentFragment();
-    
-    followers.forEach(followerData => {
+    userFollowers.forEach(followerData => {
         const follower = followerData.follow.user;
         
         const avatarUrl = follower.avatar_url || `https://images.websim.com/avatar/${follower.username}`;
         
-        const userCard = document.createElement('div');
-        userCard.className = 'user-card';
-        userCard.innerHTML = `
-            <img src="${avatarUrl}" alt="${follower.username}" loading="lazy">
-            <div class="user-card-details">
-                <h3><a href="https://websim.com/@${follower.username}" target="_blank">@${follower.username}</a></h3>
-                <p>${follower.description || 'No bio provided'}</p>
+        followersHTML += `
+            <div class="user-card">
+                <img src="${avatarUrl}" alt="${follower.username}">
+                <div class="user-card-details">
+                    <h3><a href="https://websim.com/@${follower.username}" target="_blank">@${follower.username}</a></h3>
+                    <p>${follower.description || 'No bio provided'}</p>
+                </div>
             </div>
         `;
-        
-        fragment.appendChild(userCard);
     });
     
-    container.appendChild(fragment);
+    followersContainer.innerHTML = followersHTML;
 }
 
-// Load following with pagination
+// Fetch all followers using pagination
+async function fetchAllFollowers() {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50
+    
+    const followersContainer = document.getElementById('followers-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading followers (0)...';
+    followersContainer.innerHTML = '';
+    followersContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/followers?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.followers || !data.followers.data) {
+            break;
+        }
+        
+        // Add new followers to our array
+        userFollowers = [...userFollowers, ...data.followers.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading followers (${userFollowers.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.followers.meta.has_next_page;
+        afterCursor = data.followers.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
+        }
+    }
+}
+
+// Load following with cache support
 async function loadFollowing() {
     const followingContainer = document.getElementById('following-container');
     followingContainer.innerHTML = '<div class="loading">Loading following...</div>';
@@ -523,132 +508,108 @@ async function loadFollowing() {
         // Reset following array
         userFollowing = [];
         
-        // Create progress container
-        const progressContainer = document.createElement('div');
-        progressContainer.className = 'loading-container';
-        progressContainer.innerHTML = `
-            <div class="loading-progress">Loading following (0)...</div>
-            <div class="loading-bar"><div class="loading-bar-fill"></div></div>
-        `;
-        followingContainer.innerHTML = '';
-        followingContainer.appendChild(progressContainer);
+        // Create cache key
+        const cacheKey = `following_${currentUser.username}`;
         
-        // Fetch all following using pagination
-        await fetchAllFollowing(progressContainer, followingContainer);
+        // Try to load from localStorage
+        const cachedFollowing = getFromLocalCache(cacheKey, CACHE_CONFIG.followingExpiry);
         
-        // Update UI based on result
-        if (userFollowing.length === 0) {
-            followingContainer.innerHTML = '<div class="no-results">Not following anyone</div>';
+        if (cachedFollowing) {
+            console.log("Loading following from cache");
+            userFollowing = cachedFollowing;
+            renderFollowing();
+            return;
         }
+        
+        // If not cached, fetch from API
+        console.log("Fetching following from API");
+        await fetchAllFollowing();
+        
+        // Cache the results
+        saveToLocalCache(cacheKey, userFollowing);
+        
+        renderFollowing();
     } catch (error) {
         console.error("Error loading following:", error);
-        followingContainer.innerHTML = `
-            <div class="error">
-                Failed to load following
-                <button class="retry-btn" onclick="loadFollowing()">Retry</button>
-            </div>
-        `;
+        followingContainer.innerHTML = '<div class="error">Failed to load following</div>';
     }
 }
 
-// Fetch all following using pagination with progressive rendering
-async function fetchAllFollowing(progressContainer, followingContainer) {
-    let hasNextPage = true;
-    let afterCursor = null;
-    const batchSize = 30; // Reasonable batch size
-    let totalLoaded = 0;
-    let renderQueue = [];
+// Render following to the UI
+function renderFollowing() {
+    const followingContainer = document.getElementById('following-container');
     
-    // Create following grid container
-    const gridContainer = document.createElement('div');
-    gridContainer.className = 'users-container';
-    followingContainer.appendChild(gridContainer);
-    
-    const progressElement = progressContainer.querySelector('.loading-progress');
-    const progressBarFill = progressContainer.querySelector('.loading-bar-fill');
-    
-    while (hasNextPage) {
-        try {
-            let url = `/api/v1/users/${currentUser.username}/following?first=${batchSize}`;
-            
-            if (afterCursor) {
-                url += `&after=${encodeURIComponent(afterCursor)}`;
-            }
-            
-            const response = await fetchWithRetry(url, {}, 3);
-            const data = await response.json();
-            
-            if (!data.following || !data.following.data) {
-                break;
-            }
-            
-            const newFollowing = data.following.data;
-            
-            // Add new following to our array
-            userFollowing = [...userFollowing, ...newFollowing];
-            
-            // Add to render queue
-            renderQueue = [...renderQueue, ...newFollowing];
-            
-            // If we have enough following in queue or this is the last batch, render them
-            if (renderQueue.length >= 10 || !data.following.meta.has_next_page) {
-                renderFollowingBatch(gridContainer, renderQueue);
-                renderQueue = [];
-            }
-            
-            totalLoaded += newFollowing.length;
-            
-            // Update progress indicator
-            progressElement.textContent = `Loading following (${totalLoaded})...`;
-            progressBarFill.style.width = `${Math.min(totalLoaded / Math.max(totalLoaded + 30, 50) * 100, 100)}%`;
-            
-            // Check if there are more pages
-            hasNextPage = data.following.meta.has_next_page;
-            afterCursor = data.following.meta.end_cursor;
-            
-            // If no more pages or no cursor, break the loop
-            if (!hasNextPage || !afterCursor) {
-                break;
-            }
-        } catch (error) {
-            console.error("Error fetching following batch:", error);
-            showError("Failed to load all following. Please try again.");
-            break;
-        }
+    if (userFollowing.length === 0) {
+        followingContainer.innerHTML = '<div class="no-results">Not following anyone</div>';
+        return;
     }
     
-    // Remove progress indicator
-    progressContainer.remove();
-}
-
-// Render a batch of following
-function renderFollowingBatch(container, following) {
-    if (following.length === 0) return;
+    let followingHTML = '';
     
-    const fragment = document.createDocumentFragment();
-    
-    following.forEach(followingData => {
+    userFollowing.forEach(followingData => {
         const following = followingData.follow.user;
         
         const avatarUrl = following.avatar_url || `https://images.websim.com/avatar/${following.username}`;
         
-        const userCard = document.createElement('div');
-        userCard.className = 'user-card';
-        userCard.innerHTML = `
-            <img src="${avatarUrl}" alt="${following.username}" loading="lazy">
-            <div class="user-card-details">
-                <h3><a href="https://websim.com/@${following.username}" target="_blank">@${following.username}</a></h3>
-                <p>${following.description || 'No bio provided'}</p>
+        followingHTML += `
+            <div class="user-card">
+                <img src="${avatarUrl}" alt="${following.username}">
+                <div class="user-card-details">
+                    <h3><a href="https://websim.com/@${following.username}" target="_blank">@${following.username}</a></h3>
+                    <p>${following.description || 'No bio provided'}</p>
+                </div>
             </div>
         `;
-        
-        fragment.appendChild(userCard);
     });
     
-    container.appendChild(fragment);
+    followingContainer.innerHTML = followingHTML;
 }
 
-// Load analytics data and render charts
+// Fetch all following using pagination
+async function fetchAllFollowing() {
+    let hasNextPage = true;
+    let afterCursor = null;
+    const limit = 50; // Fetch in batches of 50
+    
+    const followingContainer = document.getElementById('following-container');
+    let progressElement = document.createElement('div');
+    progressElement.className = 'loading-progress';
+    progressElement.textContent = 'Loading following (0)...';
+    followingContainer.innerHTML = '';
+    followingContainer.appendChild(progressElement);
+    
+    while (hasNextPage) {
+        let url = `/api/v1/users/${currentUser.username}/following?first=${limit}`;
+        
+        if (afterCursor) {
+            url += `&after=${encodeURIComponent(afterCursor)}`;
+        }
+        
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (!data.following || !data.following.data) {
+            break;
+        }
+        
+        // Add new following to our array
+        userFollowing = [...userFollowing, ...data.following.data];
+        
+        // Update progress indicator
+        progressElement.textContent = `Loading following (${userFollowing.length})...`;
+        
+        // Check if there are more pages
+        hasNextPage = data.following.meta.has_next_page;
+        afterCursor = data.following.meta.end_cursor;
+        
+        // If no more pages or no cursor, break the loop
+        if (!hasNextPage || !afterCursor) {
+            break;
+        }
+    }
+}
+
+// Load analytics with cache support
 async function loadAnalytics() {
     const topProjectsElement = document.getElementById('top-projects');
     topProjectsElement.innerHTML = '<div class="loading">Loading analytics...</div>';
@@ -797,6 +758,56 @@ function setupEventListeners() {
     document.getElementById('posted-only').addEventListener('change', () => {
         loadProjects();
     });
+    
+    // Add a cache clear button for testing
+    const profileHeader = document.querySelector('.profile-header');
+    const clearCacheBtn = document.createElement('button');
+    clearCacheBtn.textContent = 'Clear Cache';
+    clearCacheBtn.className = 'clear-cache-btn';
+    clearCacheBtn.addEventListener('click', clearAllCaches);
+    profileHeader.appendChild(clearCacheBtn);
+}
+
+// Clear all caches (for testing)
+async function clearAllCaches() {
+    try {
+        // Clear localStorage caches
+        const keysToRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key.startsWith('projects_') || key.startsWith('followers_') || key.startsWith('following_')) {
+                keysToRemove.push(key);
+            }
+        }
+        
+        keysToRemove.forEach(key => localStorage.removeItem(key));
+        
+        // Clear database caches for this user
+        const cacheEntries = room.collection('profile_cache')
+            .filter({ username: currentUser.username })
+            .getList();
+            
+        for (const entry of cacheEntries) {
+            await room.collection('profile_cache').delete(entry.id);
+        }
+        
+        alert('All caches cleared!');
+        
+        // Reload current tab
+        const activeTab = document.querySelector('.tab-btn.active').getAttribute('data-tab');
+        if (activeTab === 'projects') {
+            loadProjects();
+        } else if (activeTab === 'followers') {
+            loadFollowers();
+        } else if (activeTab === 'following') {
+            loadFollowing();
+        } else if (activeTab === 'analytics') {
+            loadAnalytics();
+        }
+    } catch (error) {
+        console.error('Error clearing caches:', error);
+        alert('Failed to clear some caches');
+    }
 }
 
 // Show error message
