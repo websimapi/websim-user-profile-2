@@ -6,17 +6,22 @@ let userFollowing = [];
 let isLoadingMore = false;
 let room = null; // Will be initialized with proper error handling
 let websocketRetryCount = 0;
-const MAX_WEBSOCKET_RETRIES = 5;
-const WEBSOCKET_RETRY_DELAY = 2000; // 2 seconds
+const MAX_WEBSOCKET_RETRIES = Infinity; // Unlimited retries for WebSockets as well
+const WEBSOCKET_RETRY_SCHEDULE = [15000, 30000, 60000, 120000, 300000]; // Match FETCH_CONFIG's schedule
 // Maximum chunk size for WebsimSocket messages (slightly below server limit)
 const MAX_CHUNK_SIZE = 25000; // bytes
 
 // HTTP Fetch retry configuration
 const FETCH_CONFIG = {
-    maxRetries: 5,
-    initialDelay: 1000, // 1 second
-    maxDelay: 30000, // 30 seconds
-    backoffFactor: 1.5, // Exponential backoff factor
+    // Retry schedule in milliseconds: 15s, 30s, 1m, 2m, 5m
+    retrySchedule: [
+        15 * 1000,  // 15 seconds
+        30 * 1000,  // 30 seconds
+        60 * 1000,  // 1 minute
+        120 * 1000, // 2 minutes
+        300 * 1000  // 5 minutes
+    ],
+    maxDelay: 300 * 1000, // 5 minutes (cap)
     retryStatusCodes: [408, 429, 500, 502, 503, 504] // Status codes to retry
 };
 
@@ -62,30 +67,22 @@ async function fetchWithRetry(url, options = {}, retryCount = 0) {
     try {
         // Add progress indicator to UI if this is a retry
         if (retryCount > 0) {
-            updateFetchStatus(`Retry attempt ${retryCount}/${FETCH_CONFIG.maxRetries} for: ${url.split('?')[0]}`);
+            updateFetchStatus(`Retry attempt ${retryCount} for: ${url.split('?')[0]}`);
         }
         
         const response = await fetch(url, options);
         
         // If we get a status code that warrants retry
         if (!response.ok && FETCH_CONFIG.retryStatusCodes.includes(response.status)) {
-            if (retryCount < FETCH_CONFIG.maxRetries) {
-                // Calculate delay with exponential backoff and some jitter
-                const delay = Math.min(
-                    FETCH_CONFIG.initialDelay * Math.pow(FETCH_CONFIG.backoffFactor, retryCount) + 
-                    Math.random() * 1000, // Add randomness to prevent thundering herd
-                    FETCH_CONFIG.maxDelay
-                );
-                
-                console.warn(`Fetch failed with status ${response.status}. Retrying in ${delay}ms...`);
-                updateFetchStatus(`Server error (${response.status}). Retrying in ${Math.round(delay/1000)}s...`);
-                
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return fetchWithRetry(url, options, retryCount + 1);
-            } else {
-                // All retries failed
-                throw new Error(`Failed after ${FETCH_CONFIG.maxRetries} retries: ${response.status} ${response.statusText}`);
-            }
+            // Calculate delay based on retry schedule
+            const scheduleIndex = Math.min(retryCount, FETCH_CONFIG.retrySchedule.length - 1);
+            const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+            
+            console.warn(`Fetch failed with status ${response.status}. Retrying in ${delay/1000}s...`);
+            updateFetchStatus(`Server error (${response.status}). Retrying in ${Math.round(delay/1000)}s...`);
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return fetchWithRetry(url, options, retryCount + 1);
         }
         
         if (!response.ok) {
@@ -98,21 +95,18 @@ async function fetchWithRetry(url, options = {}, retryCount = 0) {
     } catch (error) {
         // Network errors (not HTTP errors) should also be retried
         if (error.name === 'TypeError' && error.message.includes('fetch')) {
-            if (retryCount < FETCH_CONFIG.maxRetries) {
-                const delay = Math.min(
-                    FETCH_CONFIG.initialDelay * Math.pow(FETCH_CONFIG.backoffFactor, retryCount),
-                    FETCH_CONFIG.maxDelay
-                );
-                
-                console.warn(`Network error: ${error.message}. Retrying in ${delay}ms...`);
-                updateFetchStatus(`Network error. Retrying in ${Math.round(delay/1000)}s...`);
-                
-                await new Promise(resolve => setTimeout(resolve, delay));
-                return fetchWithRetry(url, options, retryCount + 1);
-            }
+            // Calculate delay based on retry schedule
+            const scheduleIndex = Math.min(retryCount, FETCH_CONFIG.retrySchedule.length - 1);
+            const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+            
+            console.warn(`Network error: ${error.message}. Retrying in ${delay/1000}s...`);
+            updateFetchStatus(`Network error. Retrying in ${Math.round(delay/1000)}s...`);
+            
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return fetchWithRetry(url, options, retryCount + 1);
         }
         
-        // Either a non-retriable error or we've exhausted retries
+        // Non-retriable error
         clearFetchStatus();
         throw error;
     }
@@ -164,18 +158,18 @@ async function initializeWebsimSocket() {
                     console.warn("Socket closed due to large message size. Using chunking strategy for future requests.");
                 }
                 
-                if (websocketRetryCount < MAX_WEBSOCKET_RETRIES) {
-                    websocketRetryCount++;
-                    console.log(`Reconnecting WebsimSocket (attempt ${websocketRetryCount}/${MAX_WEBSOCKET_RETRIES})...`);
-                    setTimeout(() => {
-                        initializeWebsimSocket()
-                            .then(() => console.log("WebsimSocket reconnected successfully"))
-                            .catch(err => console.error("Failed to reconnect WebsimSocket:", err));
-                    }, WEBSOCKET_RETRY_DELAY * websocketRetryCount);
-                } else {
-                    console.error("WebsimSocket reconnection failed after maximum retries");
-                    showError("Connection to server lost. Please refresh the page.");
-                }
+                // Get the appropriate delay based on retry count
+                const scheduleIndex = Math.min(websocketRetryCount, WEBSOCKET_RETRY_SCHEDULE.length - 1);
+                const delay = WEBSOCKET_RETRY_SCHEDULE[scheduleIndex];
+                
+                websocketRetryCount++;
+                console.log(`Reconnecting WebsimSocket (attempt ${websocketRetryCount}) in ${delay/1000}s...`);
+                
+                setTimeout(() => {
+                    initializeWebsimSocket()
+                        .then(() => console.log("WebsimSocket reconnected successfully"))
+                        .catch(err => console.error("Failed to reconnect WebsimSocket:", err));
+                }, delay);
             };
             
             // Add a custom error handler for various WebSocket errors
@@ -277,17 +271,16 @@ async function chunkAndStore(collectionName, data) {
             timestamp: new Date().toISOString()
         });
         
-        // Store each chunk with retry logic
+        // Store each chunk with unlimited retry logic
         for (let i = 0; i < numberOfChunks; i++) {
             const startPos = i * MAX_CHUNK_SIZE;
             const endPos = Math.min((i + 1) * MAX_CHUNK_SIZE, dataString.length);
             const chunkData = dataString.substring(startPos, endPos);
             
-            let retries = 0;
-            const maxRetries = 3;
+            let retryCount = 0;
             let success = false;
             
-            while (!success && retries < maxRetries) {
+            while (!success) {
                 try {
                     await room.collection(`${collectionName}_chunks`).create({
                         chunk_group_id: chunkGroupId,
@@ -297,14 +290,15 @@ async function chunkAndStore(collectionName, data) {
                     });
                     success = true;
                 } catch (chunkError) {
-                    retries++;
-                    console.warn(`Failed to store chunk ${i} (attempt ${retries}/${maxRetries}):`, chunkError);
-                    await new Promise(resolve => setTimeout(resolve, 1000 * retries));
+                    retryCount++;
+                    
+                    // Calculate delay based on retry schedule
+                    const scheduleIndex = Math.min(retryCount - 1, FETCH_CONFIG.retrySchedule.length - 1);
+                    const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+                    
+                    console.warn(`Failed to store chunk ${i} (attempt ${retryCount}). Retrying in ${delay/1000}s:`, chunkError);
+                    await new Promise(resolve => setTimeout(resolve, delay));
                 }
-            }
-            
-            if (!success) {
-                throw new Error(`Failed to store chunk ${i} after ${maxRetries} attempts`);
             }
         }
         
@@ -435,12 +429,11 @@ function getFromLocalCache(key, expiryTime) {
     }
 }
 
-// Save projects data to database cache with retry logic and chunking support
+// Save projects data to database cache with unlimited retry logic and chunking support
 async function saveProjectsToDbCache(username, projects, postedFilter, searchQuery) {
-    const maxRetries = 3;
     let retryCount = 0;
     
-    while (retryCount < maxRetries) {
+    while (true) {
         try {
             // Check if connection is alive
             if (!room) {
@@ -484,7 +477,12 @@ async function saveProjectsToDbCache(username, projects, postedFilter, searchQue
             }
         } catch (error) {
             retryCount++;
-            console.warn(`Failed to save to database cache (attempt ${retryCount}/${maxRetries}):`, error);
+            
+            // Calculate delay based on retry schedule
+            const scheduleIndex = Math.min(retryCount - 1, FETCH_CONFIG.retrySchedule.length - 1);
+            const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+            
+            console.warn(`Failed to save to database cache (attempt ${retryCount}). Retrying in ${delay/1000}s:`, error);
             
             // If it's a socket error, try to reconnect
             if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
@@ -493,25 +491,17 @@ async function saveProjectsToDbCache(username, projects, postedFilter, searchQue
                 handleWebsocketError(error);
             }
             
-            if (retryCount < maxRetries) {
-                // Wait before retrying
-                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-            } else {
-                console.error('All attempts to save to database cache failed');
-                return false;
-            }
+            // Wait before retrying
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
-    
-    return false;
 }
 
-// Get projects from database cache with support for chunked data
+// Get projects from database cache with unlimited retry support for chunked data
 async function getProjectsFromDbCache(username, postedFilter, searchQuery) {
-    const maxRetries = 3;
     let retryCount = 0;
     
-    while (retryCount < maxRetries) {
+    while (true) {
         try {
             // Check if connection is alive
             if (!room) {
@@ -578,7 +568,12 @@ async function getProjectsFromDbCache(username, postedFilter, searchQuery) {
             return latestCache.data;
         } catch (error) {
             retryCount++;
-            console.warn(`Failed to read from database cache (attempt ${retryCount}/${maxRetries}):`, error);
+            
+            // Calculate delay based on retry schedule
+            const scheduleIndex = Math.min(retryCount - 1, FETCH_CONFIG.retrySchedule.length - 1);
+            const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+            
+            console.warn(`Failed to read from database cache (attempt ${retryCount}). Retrying in ${delay/1000}s:`, error);
             
             // If it's a socket error, try to reconnect
             if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
@@ -587,17 +582,10 @@ async function getProjectsFromDbCache(username, postedFilter, searchQuery) {
                 handleWebsocketError(error);
             }
             
-            if (retryCount < maxRetries) {
-                // Wait before retrying
-                await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-            } else {
-                console.error('All attempts to read from database cache failed');
-                return null;
-            }
+            // Wait before retrying
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
-    
-    return null;
 }
 
 // Load user profile data
@@ -1417,8 +1405,7 @@ async function clearAllCaches() {
         
         keysToRemove.forEach(key => localStorage.removeItem(key));
         
-        // Clear database caches for this user with retry logic
-        const maxRetries = 3;
+        // Clear database caches for this user with unlimited retry logic
         let retryCount = 0;
         let success = false;
         
@@ -1427,7 +1414,7 @@ async function clearAllCaches() {
             await initializeWebsimSocket();
         }
         
-        while (retryCount < maxRetries && !success) {
+        while (!success) {
             try {
                 // Clear regular cache entries
                 const cacheEntries = room.collection('profile_cache')
@@ -1460,7 +1447,12 @@ async function clearAllCaches() {
                 success = true;
             } catch (error) {
                 retryCount++;
-                console.warn(`Failed to clear database caches (attempt ${retryCount}/${maxRetries}):`, error);
+                
+                // Calculate delay based on retry schedule
+                const scheduleIndex = Math.min(retryCount - 1, FETCH_CONFIG.retrySchedule.length - 1);
+                const delay = FETCH_CONFIG.retrySchedule[scheduleIndex];
+                
+                console.warn(`Failed to clear database caches (attempt ${retryCount}). Retrying in ${delay/1000}s:`, error);
                 
                 // If it's a socket error, try to reconnect
                 if (error.message && (error.message.includes('Cannot enqueue a chunk') || 
@@ -1469,12 +1461,8 @@ async function clearAllCaches() {
                     handleWebsocketError(error);
                 }
                 
-                if (retryCount < maxRetries) {
-                    // Wait before retrying
-                    await new Promise(resolve => setTimeout(resolve, 1000 * retryCount));
-                } else {
-                    throw new Error('All attempts to clear database caches failed');
-                }
+                // Wait before retrying
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
         
